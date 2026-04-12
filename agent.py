@@ -15,7 +15,7 @@ from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template
-from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files
+from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search
 
 class ReActAgent:
     # Callable意味可调用的函数
@@ -256,7 +256,7 @@ class ReActAgent:
 def main(project_directory):
     project_dir = os.path.abspath(project_directory)
 
-    tools = [read_file, write_to_file, run_terminal_command, list_directory, search_in_files]
+    tools = [read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search]
     agent = ReActAgent(tools=tools, model="gemini-2.5-flash", project_directory=project_dir)
 
     task = input("请输入任务：")
