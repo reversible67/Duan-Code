@@ -16,3 +16,6 @@ venv/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# RAG 向量库（本地数据，不上传）
+rag/chroma_db/

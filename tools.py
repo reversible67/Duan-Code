@@ -1,6 +1,8 @@
 import os
 import subprocess
 from ddgs import DDGS
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 
 def read_file(file_path):
@@ -71,3 +73,41 @@ def web_search(query: str, max_results: int = 3) -> str:
 
     except Exception as e:
         return f"搜索失败：{str(e)}"
+
+
+_rag_model = None
+_rag_collection = None
+
+def _get_rag_components():
+    """懒加载 RAG 模型和 ChromaDB collection，避免每次调用都重新初始化"""
+    global _rag_model, _rag_collection
+    if _rag_model is None:
+        _rag_model = SentenceTransformer("all-MiniLM-L6-v2")
+    if _rag_collection is None:
+        chroma_dir = os.path.join(os.path.dirname(__file__), "rag", "chroma_db")
+        client = chromadb.PersistentClient(path=chroma_dir)
+        _rag_collection = client.get_collection("knowledge_base")
+    return _rag_model, _rag_collection
+
+
+def query_knowledge_base(question: str, top_k: int = 3) -> str:
+    """查询本地知识库，返回与问题最相关的文档片段（需先运行 rag/build_index.py 构建索引）"""
+    try:
+        model, collection = _get_rag_components()
+        embedding = model.encode([question]).tolist()
+        results = collection.query(query_embeddings=embedding, n_results=top_k)
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+
+        if not documents:
+            return "知识库中未找到相关内容"
+
+        output = []
+        for i, (doc, meta) in enumerate(zip(documents, metadatas), 1):
+            source = meta.get("source", "未知来源")
+            output.append(f"【片段{i}】来源：{source}\n{doc}")
+
+        return "\n\n".join(output)
+
+    except Exception as e:
+        return f"知识库查询失败：{str(e)}（请先运行 uv run python rag/build_index.py 构建索引）"
