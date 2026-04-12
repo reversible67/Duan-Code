@@ -3,7 +3,7 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files
+from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search
 
 TEST_DIR = os.path.dirname(__file__)
 TEMP_FILE = os.path.join(TEST_DIR, "temp_test_file.txt")
@@ -39,6 +39,13 @@ def test_search_in_files():
     print(f"✅ search_in_files 通过，搜索结果:\n{result}")
 
 
+def test_web_search():
+    result = web_search("Python programming", max_results=2)
+    assert "搜索失败" not in result, f"搜索失败: {result}"
+    assert "结果" in result, f"搜索结果格式异常: {result}"
+    print(f"✅ web_search 通过，搜索结果:\n{result}")
+
+
 def cleanup():
     if os.path.exists(TEMP_FILE):
         os.remove(TEMP_FILE)
@@ -55,7 +62,8 @@ if __name__ == "__main__":
     test_run_terminal_command()
     test_list_directory()
     test_search_in_files()
-    # cleanup()
+    test_web_search()
+    cleanup()
 
     print("\n" + "=" * 50)
     print("✅ 所有测试通过！")
