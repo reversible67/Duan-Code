@@ -1,17 +1,18 @@
 [project]
-name = "react-ai-agent"
+name = "agent"
 version = "0.1.0"
-authors = [
-  { name="端", email="w_duan2001@163.com" }
-]
-description = "A ReAct AI agent with tool calling, file operations and terminal command execution"
-requires-python = ">=3.10"
+description = "ReAct AI Agent"
+readme = "README.md"
+requires-python = ">=3.11"
 dependencies = [
-  "openai>=1.0.0",
-  "click>=8.0.0",
-  "python-dotenv>=1.0.0",
+    "click>=8.2.1",
+    "openai>=1.91.0",
+    "python-dotenv>=1.1.1",
+    "gradio>=4.0.0",
+    "requests>=2.33.1",
+    "ddgs>=9.13.0",
+    "zhipuai>=2.1.5.20250825",
+    "google-genai>=1.72.0",
 ]
 
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+[tool.uv]

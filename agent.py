@@ -9,8 +9,9 @@ from typing import List, Callable, Tuple  # 类型注解：标注变量/函数�
 # 2. 第三方库 (需要用pip安装才能使用)
 import click                              # 命令行工具：快速创建可在终端运行的命令、参数、选项
 from dotenv import load_dotenv            # 加载.env文件：把私密配置（密钥、账号）存在文件里，不写死在代码
-from openai import OpenAI                 # OpenAI官方SDK：调用GPT等大模型API
+import httpx                              # HTTP客户端：支持代理配置，用于绕过地区限制
 import platform                           # 获取系统信息：判断是Windows、Mac还是Linux
+from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template
@@ -23,10 +24,14 @@ class ReActAgent:
         self.tools = { func.__name__: func for func in tools }
         self.model = model
         self.project_directory = project_directory
-        self.client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=ReActAgent.get_api_key(),
-        )
+        load_dotenv()
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+        if proxy:
+            httpx_client = httpx.Client(proxy=proxy)
+            http_options = genai.types.HttpOptions(httpx_client=httpx_client)
+            self.client = genai.Client(api_key=self.get_api_key(), http_options=http_options)
+        else:
+            self.client = genai.Client(api_key=self.get_api_key())
     
     def run(self, user_input: str):
         messages = [
@@ -104,22 +109,63 @@ class ReActAgent:
             file_list=file_list
         )
         
-    def get_api_key() -> str:
+    def get_api_key(self) -> str:
         """Load the API key from an environment variable."""
         load_dotenv()
-        api_key = os.getenv("OPENROUTER_API_KEY")
+        api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise ValueError("未找到 OPENROUTER_API_KEY 环境变量，请在 .env 文件中设置。")
+            raise ValueError("未找到 GOOGLE_API_KEY 环境变量，请在 .env 文件中设置。")
         return api_key
     
-    def call_model(self, messages):
+    def call_native_model(self, messages):
         print("\n\n正在请求模型，请稍等...")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
+        import requests
+    
+        # Ollama 原生接口，彻底摆脱 OpenAI
+        response = requests.post(
+            "http://localhost:11434/api/chat",
+            json={
+                "model": self.model,
+                "messages": messages,
+                "stream": False
+            },
+            timeout=120
         )
-        content = response.choices[0].message.content
+        
+        
+        response.raise_for_status()
+        content = response.json()["message"]["content"]
         messages.append({"role": "assistant", "content": content})
+        return content
+    
+    def call_model(self, messages):
+        print("\n\n正在请求 Gemini 2.5 Flash，请稍等...")
+        
+        # 拆分系统提示词（Gemini要求单独传，不能放在对话历史里）
+        system_prompt = ""
+        chat_history = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_prompt = msg["content"]
+            else:
+                # 转换为Gemini支持的消息格式
+                chat_history.append({
+                    "role": msg["role"],
+                    "parts": [{"text": msg["content"]}]
+                })
+        
+        # 调用Gemini新版API（和官网完全一致）
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=chat_history,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.7
+            )
+        )
+
+        content = response.text if response.text else "模型未返回有效内容，请重试"
+        messages.append({"role": "model", "content": content})
         return content
     
     def parse_action(self, code_str: str) -> Tuple[str, List[str]]:
@@ -203,22 +249,23 @@ class ReActAgent:
 
         return os_map.get(platform.system(), "Unknown")
 
-    def read_file(file_path):
-        """用于读取文件内容"""
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
+def read_file(file_path):
+    """用于读取文件内容"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read()
         
-    def write_to_file(file_path, content):
-        """将指定内容写入指定文件"""
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content.replace("\\n", "\n"))
-        return "写入成功"
+def write_to_file(file_path, content):
+    """将指定内容写入指定文件"""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content.replace("\\n", "\n"))
+    return "写入成功"
     
-    def run_terminal_command(command):
-        """用于执行终端命令"""
-        import subprocess
-        run_result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        return "执行成功" if run_result.returncode == 0 else run_result.stderr
+def run_terminal_command(command):
+    """用于执行终端命令"""
+    import subprocess
+    run_result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return "执行成功" if run_result.returncode == 0 else run_result.stderr
 
 @click.command()
 @click.argument('project_directory',
@@ -227,7 +274,7 @@ def main(project_directory):
     project_dir = os.path.abspath(project_directory)
 
     tools = [read_file, write_to_file, run_terminal_command]
-    agent = ReActAgent(tools=tools, model="openai/gpt-4o", project_directory=project_dir)
+    agent = ReActAgent(tools=tools, model="gemini-2.5-flash", project_directory=project_dir)
 
     task = input("请输入任务：")
 
