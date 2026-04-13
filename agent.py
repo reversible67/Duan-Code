@@ -37,12 +37,31 @@ class ReActAgent:
                 self.client = genai.Client(api_key=self.get_api_key())
         else:
             self.client = None  # Ollama 模式不需要 Gemini client
+        self.session_history: list[dict] = []  # 会话级记忆：记录本次启动中的所有任务和答案
     
     MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
+    MAX_SESSION_HISTORY = 5  # 注入上下文时最多使用最近 N 条历史
+
+    def _build_session_context(self) -> str:
+        """将最近 N 条会话历史格式化为字符串，注入当前任务上下文"""
+        recent = self.session_history[-self.MAX_SESSION_HISTORY:]
+        if not recent:
+            return ""
+        lines = ["以下是本次会话中已完成的历史任务（供参考）："]
+        for i, record in enumerate(recent, 1):
+            lines.append(f"[历史任务 {i}] 用户：{record['task']}")
+            lines.append(f"           结果：{record['answer'][:200]}{'...' if len(record['answer']) > 200 else ''}")
+        return "\n".join(lines)
 
     def run(self, user_input: str):
+        original_task = user_input
         skills = load_skills()
         skill = None
+
+        # 显示会话历史摘要（若有）
+        session_ctx = self._build_session_context()
+        if session_ctx:
+            print(f"\n\n 会话记忆已加载（{len(self.session_history)} 条历史）")
 
         # 优先级1：slash 命令精确触发（/skill-name [可选附加描述]）
         if user_input.startswith("/"):
@@ -50,17 +69,17 @@ class ReActAgent:
             skill_name = parts[0]
             skill = next((s for s in skills if s["name"] == skill_name), None)
             if skill:
-                print(f"\n\n⚡ Slash 命令触发技能：/{skill['name']} — {skill.get('description', '')}")
+                print(f"\n\n Slash 命令触发技能：/{skill['name']} — {skill.get('description', '')}")
                 user_input = parts[1] if len(parts) > 1 else skill.get("description", skill_name)
             else:
-                print(f"\n\n⚠️ 未找到技能 /{skill_name}，可用技能：{', '.join('/'+s['name'] for s in skills)}")
+                print(f"\n\n 未找到技能 /{skill_name}，可用技能：{', '.join('/'+s['name'] for s in skills)}")
                 return "未知 slash 命令"
 
         # 优先级2：关键词模糊匹配
         if not skill:
             skill = match_skill(user_input, skills)
             if skill:
-                print(f"\n\n⚡ 匹配到技能：{skill['name']} — {skill.get('description', '')}")
+                print(f"\n\n 匹配到技能：{skill['name']} — {skill.get('description', '')}")
 
         if skill:
             steps = skill["steps"]
@@ -68,19 +87,23 @@ class ReActAgent:
             # 优先级3：LLM 规划
             steps = self.plan(user_input)
         if not steps:
-            print("\n\n⚠️ 规划失败，降级为纯 ReAct 模式执行...")
-            return self._react_loop(user_input, context="")
+            print("\n\n 规划失败，降级为纯 ReAct 模式执行...")
+            result = self._react_loop(user_input, context=session_ctx)
+            self.session_history.append({"task": original_task, "answer": result})
+            return result
 
-        print("\n\n📋 执行计划：")
+        print("\n\n 执行计划：")
         for i, step in enumerate(steps, 1):
             print(f"  Step {i}: {step}")
         confirm = input("\n\n是否按此计划执行？（Y/N，直接回车确认）").strip().lower()
         if confirm == 'n':
             print("\n\n计划已取消，切换为直接对话模式...")
-            return self._react_loop(user_input, context="")
+            result = self._react_loop(user_input, context=session_ctx)
+            self.session_history.append({"task": original_task, "answer": result})
+            return result
 
-        # 执行阶段：依次执行每个步骤，传递上下文
-        context = ""
+        # 执行阶段：依次执行每个步骤，传递上下文（携带会话历史）
+        context = session_ctx
         for i, step in enumerate(steps, 1):
             print(f"\n\n{'='*50}")
             print(f"▶️  执行 Step {i}/{len(steps)}: {step}")
@@ -89,18 +112,20 @@ class ReActAgent:
             context += f"\n[Step {i} 结果] {result}"
 
         # 所有步骤完成后，让模型汇总最终答案
-        print("\n\n🏁 所有步骤执行完成，正在汇总...")
+        print("\n\n 所有步骤执行完成，正在汇总...")
         summary_messages = [
             {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)},
             {"role": "user", "content": f"<question>{user_input}</question>\n\n以下是各步骤的执行结果摘要，请基于此给出最终答案：\n{context}\n\n请直接输出 <final_answer>...</final_answer>"}
         ]
         final_content = self.dispatch_model(summary_messages)
         final_match = re.search(r"<final_answer>(.*?)</final_answer>", final_content, re.DOTALL)
-        return final_match.group(1) if final_match else context
+        final_answer = final_match.group(1) if final_match else context
+        self.session_history.append({"task": original_task, "answer": final_answer})
+        return final_answer
 
     def plan(self, user_input: str) -> list:
         """调用一次 LLM 生成步骤列表，返回 step 字符串列表"""
-        print("\n\n🗺️  正在规划任务步骤...")
+        print("\n\n 正在规划任务步骤...")
         messages = [
             {"role": "system", "content": self.render_system_prompt(plan_system_prompt_template)},
             {"role": "user", "content": f"任务：{user_input}"}
