@@ -27,13 +27,16 @@ class ReActAgent:
         self.model = model
         self.project_directory = project_directory
         load_dotenv()
-        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-        if proxy:
-            httpx_client = httpx.Client(proxy=proxy, timeout=httpx.Timeout(60.0, connect=10.0))
-            http_options = genai.types.HttpOptions(httpx_client=httpx_client)
-            self.client = genai.Client(api_key=self.get_api_key(), http_options=http_options)
+        if model.startswith("gemini"):
+            proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+            if proxy:
+                httpx_client = httpx.Client(proxy=proxy, timeout=httpx.Timeout(60.0, connect=10.0))
+                http_options = genai.types.HttpOptions(httpx_client=httpx_client)
+                self.client = genai.Client(api_key=self.get_api_key(), http_options=http_options)
+            else:
+                self.client = genai.Client(api_key=self.get_api_key())
         else:
-            self.client = genai.Client(api_key=self.get_api_key())
+            self.client = None  # Ollama 模式不需要 Gemini client
     
     MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
 
@@ -91,7 +94,7 @@ class ReActAgent:
             {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)},
             {"role": "user", "content": f"<question>{user_input}</question>\n\n以下是各步骤的执行结果摘要，请基于此给出最终答案：\n{context}\n\n请直接输出 <final_answer>...</final_answer>"}
         ]
-        final_content = self.call_model(summary_messages)
+        final_content = self.dispatch_model(summary_messages)
         final_match = re.search(r"<final_answer>(.*?)</final_answer>", final_content, re.DOTALL)
         return final_match.group(1) if final_match else context
 
@@ -102,7 +105,7 @@ class ReActAgent:
             {"role": "system", "content": self.render_system_prompt(plan_system_prompt_template)},
             {"role": "user", "content": f"任务：{user_input}"}
         ]
-        content = self.call_model(messages)
+        content = self.dispatch_model(messages)
         steps = re.findall(r"<step>(.*?)</step>", content, re.DOTALL)
         return [s.strip() for s in steps if s.strip()]
 
@@ -117,7 +120,7 @@ class ReActAgent:
         max_rounds = 10
         for _ in range(max_rounds):
             self._compress_history(messages)
-            content = self.call_model(messages)
+            content = self.dispatch_model(messages)
 
             thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
             if thought_match:
@@ -168,7 +171,7 @@ class ReActAgent:
 
         while True:
             self._compress_history(messages)
-            content = self.call_model(messages)
+            content = self.dispatch_model(messages)
 
             thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
             if thought_match:
@@ -261,6 +264,13 @@ class ReActAgent:
             raise ValueError("未找到 GOOGLE_API_KEY 环境变量，请在 .env 文件中设置。")
         return api_key
     
+    def dispatch_model(self, messages):
+        """根据 self.model 路由到对应的模型调用函数"""
+        if self.model.startswith("gemini"):
+            return self.call_model(messages)
+        else:
+            return self.call_native_model(messages)
+
     def call_native_model(self, messages):
         print("\n\n正在请求模型，请稍等...")
         import requests
@@ -401,13 +411,18 @@ class ReActAgent:
 @click.command()
 @click.argument('project_directory',
                 type=click.Path(exists=True, file_okay=False, dir_okay=True))
-def main(project_directory):
+@click.option('--model', default='gemini-2.5-flash',
+              show_default=True,
+              help='模型名称。gemini-* 使用 Google API；其他值（如 qwen2.5:3b）通过 Ollama 本地运行')
+def main(project_directory, model):
     project_dir = os.path.abspath(project_directory)
 
     tools = [read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base]
-    agent = ReActAgent(tools=tools, model="gemini-2.5-flash", project_directory=project_dir)
+    agent = ReActAgent(tools=tools, model=model, project_directory=project_dir)
 
+    backend = "Google Gemini API" if model.startswith("gemini") else f"Ollama 本地 ({model})"
     print("\n🤖 Agent 已启动，输入 'exit' 或 'quit' 退出对话")
+    print(f"🧠 模型：{model}  ({backend})")
     print(f"📁 工作目录：{project_dir}")
     print("=" * 50)
 
