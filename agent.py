@@ -273,17 +273,22 @@ class ReActAgent:
                     "parts": [{"text": msg["content"]}]
                 })
         
-        # 调用Gemini新版API（和官网完全一致）
-        response = self.client.models.generate_content(
+        # 流式调用，实时打印 token
+        chunks = []
+        for chunk in self.client.models.generate_content_stream(
             model=self.model,
             contents=chat_history,
             config=genai.types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.7
             )
-        )
-
-        content = response.text if response.text else "模型未返回有效内容，请重试"
+        ):
+            if chunk.text:
+                print(chunk.text, end="", flush=True)
+                chunks.append(chunk.text)
+        
+        print()  # 换行
+        content = "".join(chunks) if chunks else "模型未返回有效内容，请重试"
         messages.append({"role": "model", "content": content})
         return content
     
@@ -377,11 +382,26 @@ def main(project_directory):
     tools = [read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base]
     agent = ReActAgent(tools=tools, model="gemini-2.5-flash", project_directory=project_dir)
 
-    task = input("请输入任务：")
+    print("\n🤖 Agent 已启动，输入 'exit' 或 'quit' 退出对话")
+    print(f"📁 工作目录：{project_dir}")
+    print("=" * 50)
 
-    final_answer = agent.run(task)
+    while True:
+        try:
+            task = input("\n请输入任务：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n👋 已退出")
+            break
 
-    print(f"\n\n✅ Final Answer：{final_answer}")
+        if not task:
+            continue
+        if task.lower() in ("exit", "quit", "q", "退出"):
+            print("\n\n👋 已退出")
+            break
+
+        final_answer = agent.run(task)
+        print(f"\n\n✅ Final Answer：{final_answer}")
+        print("\n" + "=" * 50)
 
 if __name__ == "__main__":
     main()
