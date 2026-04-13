@@ -16,6 +16,7 @@ from google import genai
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template, plan_system_prompt_template
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
+from skills import load_skills, match_skill
 
 class ReActAgent:
     # Callable意味可调用的函数
@@ -28,7 +29,7 @@ class ReActAgent:
         load_dotenv()
         proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
         if proxy:
-            httpx_client = httpx.Client(proxy=proxy)
+            httpx_client = httpx.Client(proxy=proxy, timeout=httpx.Timeout(60.0, connect=10.0))
             http_options = genai.types.HttpOptions(httpx_client=httpx_client)
             self.client = genai.Client(api_key=self.get_api_key(), http_options=http_options)
         else:
@@ -37,8 +38,32 @@ class ReActAgent:
     MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
 
     def run(self, user_input: str):
-        # 规划阶段：生成执行计划并展示给用户确认
-        steps = self.plan(user_input)
+        skills = load_skills()
+        skill = None
+
+        # 优先级1：slash 命令精确触发（/skill-name [可选附加描述]）
+        if user_input.startswith("/"):
+            parts = user_input[1:].split(None, 1)
+            skill_name = parts[0]
+            skill = next((s for s in skills if s["name"] == skill_name), None)
+            if skill:
+                print(f"\n\n⚡ Slash 命令触发技能：/{skill['name']} — {skill.get('description', '')}")
+                user_input = parts[1] if len(parts) > 1 else skill.get("description", skill_name)
+            else:
+                print(f"\n\n⚠️ 未找到技能 /{skill_name}，可用技能：{', '.join('/'+s['name'] for s in skills)}")
+                return "未知 slash 命令"
+
+        # 优先级2：关键词模糊匹配
+        if not skill:
+            skill = match_skill(user_input, skills)
+            if skill:
+                print(f"\n\n⚡ 匹配到技能：{skill['name']} — {skill.get('description', '')}")
+
+        if skill:
+            steps = skill["steps"]
+        else:
+            # 优先级3：LLM 规划
+            steps = self.plan(user_input)
         if not steps:
             print("\n\n⚠️ 规划失败，降级为纯 ReAct 模式执行...")
             return self._react_loop(user_input, context="")
@@ -258,7 +283,7 @@ class ReActAgent:
         return content
     
     def call_model(self, messages):
-        print("\n\n正在请求 Gemini 2.5 Flash，请稍等...")
+        print("\n\n🤖 ", end="", flush=True)
         
         # 拆分系统提示词（Gemini要求单独传，不能放在对话历史里）
         system_prompt = ""
