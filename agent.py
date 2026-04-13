@@ -14,7 +14,7 @@ import platform                           # 获取系统信息：判断是Window
 from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
-from prompt_template import react_system_prompt_template
+from prompt_template import react_system_prompt_template, plan_system_prompt_template
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
 
 class ReActAgent:
@@ -37,6 +37,104 @@ class ReActAgent:
     MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
 
     def run(self, user_input: str):
+        # 规划阶段：生成执行计划并展示给用户确认
+        steps = self.plan(user_input)
+        if not steps:
+            print("\n\n⚠️ 规划失败，降级为纯 ReAct 模式执行...")
+            return self._react_loop(user_input, context="")
+
+        print("\n\n📋 执行计划：")
+        for i, step in enumerate(steps, 1):
+            print(f"  Step {i}: {step}")
+        confirm = input("\n\n是否按此计划执行？（Y/N，直接回车确认）").strip().lower()
+        if confirm == 'n':
+            print("\n\n计划已取消，切换为直接对话模式...")
+            return self._react_loop(user_input, context="")
+
+        # 执行阶段：依次执行每个步骤，传递上下文
+        context = ""
+        for i, step in enumerate(steps, 1):
+            print(f"\n\n{'='*50}")
+            print(f"▶️  执行 Step {i}/{len(steps)}: {step}")
+            print(f"{'='*50}")
+            result = self.execute_step(step, context, user_input)
+            context += f"\n[Step {i} 结果] {result}"
+
+        # 所有步骤完成后，让模型汇总最终答案
+        print("\n\n🏁 所有步骤执行完成，正在汇总...")
+        summary_messages = [
+            {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)},
+            {"role": "user", "content": f"<question>{user_input}</question>\n\n以下是各步骤的执行结果摘要，请基于此给出最终答案：\n{context}\n\n请直接输出 <final_answer>...</final_answer>"}
+        ]
+        final_content = self.call_model(summary_messages)
+        final_match = re.search(r"<final_answer>(.*?)</final_answer>", final_content, re.DOTALL)
+        return final_match.group(1) if final_match else context
+
+    def plan(self, user_input: str) -> list:
+        """调用一次 LLM 生成步骤列表，返回 step 字符串列表"""
+        print("\n\n🗺️  正在规划任务步骤...")
+        messages = [
+            {"role": "system", "content": self.render_system_prompt(plan_system_prompt_template)},
+            {"role": "user", "content": f"任务：{user_input}"}
+        ]
+        content = self.call_model(messages)
+        steps = re.findall(r"<step>(.*?)</step>", content, re.DOTALL)
+        return [s.strip() for s in steps if s.strip()]
+
+    def execute_step(self, step: str, context: str, original_task: str) -> str:
+        """用 ReAct 小循环执行单个步骤，最多 10 轮，返回执行结果摘要"""
+        context_hint = f"\n\n前置步骤执行结果（供参考）：{context}" if context else ""
+        system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)}
+        messages = [
+            system_msg,
+            {"role": "user", "content": f"<question>总体任务：{original_task}\n\n当前步骤：{step}{context_hint}</question>"}
+        ]
+        max_rounds = 10
+        for _ in range(max_rounds):
+            self._compress_history(messages)
+            content = self.call_model(messages)
+
+            thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
+            if thought_match:
+                print(f"\n\n💭 Thought: {thought_match.group(1).strip()}")
+
+            if "<final_answer>" in content:
+                final_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
+                return final_match.group(1).strip() if final_match else "步骤完成"
+
+            action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
+            if not action_match:
+                messages.append({"role": "user", "content": "<observation>格式错误：你必须输出 <action>...</action> 标签，请重新按格式输出。</observation>"})
+                continue
+
+            action = action_match.group(1).strip()
+            try:
+                tool_name, args = self.parse_action(action)
+            except Exception as e:
+                messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\")。</observation>"})
+                continue
+
+            if tool_name not in self.tools:
+                available = ', '.join(self.tools.keys())
+                messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用工具：{available}</observation>"})
+                continue
+
+            print(f"\n\n� Action: {tool_name}({', '.join(str(a) for a in args)})")
+            should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
+            if should_continue.lower() != 'y':
+                return "步骤被用户取消"
+
+            try:
+                observation = self.tools[tool_name](*args)
+            except Exception as e:
+                observation = f"工具执行错误：{str(e)}"
+            print(f"\n\n🔍 Observation：{observation}")
+            messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+
+        return "步骤达到最大执行轮数"
+
+    def _react_loop(self, user_input: str, context: str) -> str:
+        """原始 ReAct 单循环，作为降级兜底"""
         system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)}
         messages = [
             system_msg,
@@ -45,22 +143,16 @@ class ReActAgent:
 
         while True:
             self._compress_history(messages)
-
-            # 请求模型
             content = self.call_model(messages)
 
-            # 检测 Thought
             thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
             if thought_match:
-                thought = thought_match.group(1)
-                print(f"\n\n💭 Thought: {thought}")
+                print(f"\n\n💭 Thought: {thought_match.group(1).strip()}")
 
-            # 检测模型是否输出 Final Answer，如果是的话，直接返回
             if "<final_answer>" in content:
                 final_answer = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
                 return final_answer.group(1)
 
-            # 检测 Action，失败时反馈给模型重试
             action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
             if not action_match:
                 print("\n\n⚠️ 模型未输出 <action>，反馈重试...")
@@ -82,8 +174,7 @@ class ReActAgent:
                 continue
 
             print(f"\n\n🔧 Action: {tool_name}({', '.join(str(a) for a in args)})")
-            # 只有终端命令才需要询问用户，其他的工具直接执行
-            should_continue = input(f"\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
+            should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
             if should_continue.lower() != 'y':
                 print("\n\n操作已取消。")
                 return "操作被用户取消"
@@ -93,8 +184,7 @@ class ReActAgent:
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
             print(f"\n\n🔍 Observation：{observation}")
-            obs_msg = f"<observation>{observation}</observation>"
-            messages.append({"role": "user", "content": obs_msg})
+            messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
 
     def _compress_history(self, messages: list):
         """当非 system 消息超过阈值时，保留 system + 首条用户问题 + 最近 N 条"""
