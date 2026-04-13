@@ -19,10 +19,13 @@ def write_to_file(file_path, content):
     return "写入成功"
 
 
-def run_terminal_command(command):
-    """用于执行终端命令"""
-    run_result = subprocess.run(command, shell=True, capture_output=True, text=True)
-    return "执行成功" if run_result.returncode == 0 else run_result.stderr
+def run_terminal_command(command, timeout: int = 60):
+    """用于执行终端命令，timeout 为超时秒数（默认60秒）"""
+    try:
+        run_result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+        return "执行成功" if run_result.returncode == 0 else run_result.stderr
+    except subprocess.TimeoutExpired:
+        return f"命令执行超时（>{timeout}s），已终止"
 
 
 def list_directory(path):

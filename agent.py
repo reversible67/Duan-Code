@@ -34,13 +34,17 @@ class ReActAgent:
         else:
             self.client = genai.Client(api_key=self.get_api_key())
     
+    MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
+
     def run(self, user_input: str):
+        system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)}
         messages = [
-            {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)},
+            system_msg,
             {"role": "user", "content": f"<question>{user_input}</question>"}
         ]
 
         while True:
+            self._compress_history(messages)
 
             # 请求模型
             content = self.call_model(messages)
@@ -56,14 +60,28 @@ class ReActAgent:
                 final_answer = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
                 return final_answer.group(1)
 
-            # 检测 Action
+            # 检测 Action，失败时反馈给模型重试
             action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
             if not action_match:
-                raise RuntimeError("模型未输出 <action>")
-            action = action_match.group(1)
-            tool_name, args = self.parse_action(action)
+                print("\n\n⚠️ 模型未输出 <action>，反馈重试...")
+                messages.append({"role": "user", "content": "<observation>格式错误：你必须输出 <action>...</action> 标签，请重新按格式输出。</observation>"})
+                continue
 
-            print(f"\n\n🔧 Action: {tool_name}({', '.join(args)})")
+            action = action_match.group(1).strip()
+            try:
+                tool_name, args = self.parse_action(action)
+            except Exception as e:
+                print(f"\n\n⚠️ Action 解析失败：{e}，反馈重试...")
+                messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\")。</observation>"})
+                continue
+
+            if tool_name not in self.tools:
+                print(f"\n\n⚠️ 工具 {tool_name} 不存在，反馈重试...")
+                available = ', '.join(self.tools.keys())
+                messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用工具：{available}</observation>"})
+                continue
+
+            print(f"\n\n🔧 Action: {tool_name}({', '.join(str(a) for a in args)})")
             # 只有终端命令才需要询问用户，其他的工具直接执行
             should_continue = input(f"\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
             if should_continue.lower() != 'y':
@@ -71,15 +89,25 @@ class ReActAgent:
                 return "操作被用户取消"
 
             try:
-                # 函数执行逻辑
                 observation = self.tools[tool_name](*args)
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
             print(f"\n\n🔍 Observation：{observation}")
             obs_msg = f"<observation>{observation}</observation>"
-            # 把历史对话 + 执行结果全部给 AI 继续推理 继续干活
             messages.append({"role": "user", "content": obs_msg})
-    
+
+    def _compress_history(self, messages: list):
+        """当非 system 消息超过阈值时，保留 system + 首条用户问题 + 最近 N 条"""
+        non_system = [m for m in messages if m["role"] != "system"]
+        if len(non_system) <= self.MAX_HISTORY_MESSAGES:
+            return
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        first_user = next((m for m in messages if m["role"] == "user"), None)
+        recent = non_system[-(self.MAX_HISTORY_MESSAGES // 2):]
+        kept = system_msgs + ([first_user] if first_user and first_user not in recent else []) + recent
+        messages[:] = kept
+        print(f"\n\n📦 历史已压缩，保留 {len(messages)} 条消息")
+
     # 给 AI 生成工具使用说明书
     def get_tool_list(self) -> str:
         """生成工具列表字符串，包含函数签名和简要说明"""
