@@ -5,10 +5,18 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 
+MAX_READ_SIZE = 100 * 1024  # 100KB，超过此大小的文件只读取前部分
+
+IGNORED_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.idea', '.vscode', 'chroma_db'}
+
 def read_file(file_path):
-    """用于读取文件内容"""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+    """用于读取文件内容（超过100KB的文件只读取前部分）"""
+    file_size = os.path.getsize(file_path)
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read(MAX_READ_SIZE)
+    if file_size > MAX_READ_SIZE:
+        content += f"\n\n... [文件过大，仅显示前 {MAX_READ_SIZE // 1024}KB，完整文件约 {file_size // 1024}KB]"
+    return content
 
 
 def write_to_file(file_path, content):
@@ -29,9 +37,10 @@ def run_terminal_command(command, timeout: int = 60):
 
 
 def list_directory(path):
-    """列出指定目录下的所有文件和子目录"""
+    """列出指定目录下的所有文件和子目录（自动排除 .git/.venv 等目录）"""
     result = []
-    for root, dirs, files in os.walk(path):
+    for root, dirs, files in os.walk(path, topdown=True):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
         level = root.replace(path, "").count(os.sep)
         indent = "  " * level
         result.append(f"{indent}{os.path.basename(root)}/")
@@ -42,9 +51,10 @@ def list_directory(path):
 
 
 def search_in_files(keyword, directory):
-    """在指定目录下的所有文件中搜索包含关键词的行，返回文件名、行号和匹配内容"""
+    """在指定目录下的所有文件中搜索包含关键词的行（自动排除 .git/.venv 等目录）"""
     matches = []
-    for root, _, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory, topdown=True):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
         for file in files:
             file_path = os.path.join(root, file)
             try:

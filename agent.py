@@ -126,9 +126,11 @@ class ReActAgent:
     def plan(self, user_input: str) -> list:
         """调用一次 LLM 生成步骤列表，返回 step 字符串列表"""
         print("\n\n 正在规划任务步骤...")
+        session_ctx = self._build_session_context()
+        context_hint = f"\n\n{session_ctx}" if session_ctx else ""
         messages = [
             {"role": "system", "content": self.render_system_prompt(plan_system_prompt_template)},
-            {"role": "user", "content": f"任务：{user_input}"}
+            {"role": "user", "content": f"任务：{user_input}{context_hint}"}
         ]
         content = self.dispatch_model(messages)
         steps = re.findall(r"<step>(.*?)</step>", content, re.DOTALL)
@@ -172,7 +174,15 @@ class ReActAgent:
                 messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用工具：{available}</observation>"})
                 continue
 
-            print(f"\n\n� Action: {tool_name}({', '.join(str(a) for a in args)})")
+            # 路径边界校验：read_file/write_to_file 只允许操作项目目录内的文件
+            if tool_name in ("read_file", "write_to_file") and args:
+                if not self._validate_path(str(args[0])):
+                    observation = f"路径 '{args[0]}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
+                    print(f"\n\n Observation：{observation}")
+                    messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+                    continue
+
+            print(f"\n\n Action: {tool_name}({', '.join(str(a) for a in args)})")
             should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
             if should_continue.lower() != 'y':
                 return "步骤被用户取消"
@@ -181,20 +191,22 @@ class ReActAgent:
                 observation = self.tools[tool_name](*args)
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
-            print(f"\n\n🔍 Observation：{observation}")
+            print(f"\n\n Observation：{observation}")
             messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
 
         return "步骤达到最大执行轮数"
 
     def _react_loop(self, user_input: str, context: str) -> str:
         """原始 ReAct 单循环，作为降级兜底"""
+        context_hint = f"\n\n{context}" if context else ""
         system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)}
         messages = [
             system_msg,
-            {"role": "user", "content": f"<question>{user_input}</question>"}
+            {"role": "user", "content": f"<question>{user_input}</question>{context_hint}"}
         ]
 
-        while True:
+        max_rounds = 15
+        for _ in range(max_rounds):
             self._compress_history(messages)
             content = self.dispatch_model(messages)
 
@@ -226,7 +238,15 @@ class ReActAgent:
                 messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用工具：{available}</observation>"})
                 continue
 
-            print(f"\n\n🔧 Action: {tool_name}({', '.join(str(a) for a in args)})")
+            # 路径边界校验：read_file/write_to_file 只允许操作项目目录内的文件
+            if tool_name in ("read_file", "write_to_file") and args:
+                if not self._validate_path(str(args[0])):
+                    observation = f"路径 '{args[0]}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
+                    print(f"\n\n Observation：{observation}")
+                    messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+                    continue
+
+            print(f"\n\n Action: {tool_name}({', '.join(str(a) for a in args)})")
             should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
             if should_continue.lower() != 'y':
                 print("\n\n操作已取消。")
@@ -236,8 +256,10 @@ class ReActAgent:
                 observation = self.tools[tool_name](*args)
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
-            print(f"\n\n🔍 Observation：{observation}")
+            print(f"\n\n Observation：{observation}")
             messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+
+        return "ReAct 循环达到最大执行轮数"
 
     def _compress_history(self, messages: list):
         """当非 system 消息超过阈值时，保留 system + 首条用户问题 + 最近 N 条"""
@@ -327,9 +349,10 @@ class ReActAgent:
             if msg["role"] == "system":
                 system_prompt = msg["content"]
             else:
-                # 转换为Gemini支持的消息格式
+                # 转换为Gemini支持的消息格式（Gemini 要求 assistant 角色用 "model"）
+                gemini_role = "model" if msg["role"] == "assistant" else msg["role"]
                 chat_history.append({
-                    "role": msg["role"],
+                    "role": gemini_role,
                     "parts": [{"text": msg["content"]}]
                 })
         
@@ -349,7 +372,7 @@ class ReActAgent:
         
         print()  # 换行
         content = "".join(chunks) if chunks else "模型未返回有效内容，请重试"
-        messages.append({"role": "model", "content": content})
+        messages.append({"role": "assistant", "content": content})
         return content
     
     def parse_action(self, code_str: str) -> Tuple[str, List[str]]:
