@@ -4,6 +4,9 @@ plan_system_prompt_template = """
 你可以使用的工具：
 ${tool_list}
 
+可用技能目录（这里只展示目录信息，不是技能正文）：
+${skill_list}
+
 环境信息：
 操作系统：${operating_system}
 当前目录下文件列表：${file_list}
@@ -44,7 +47,7 @@ react_system_prompt_template = """
 
 ⸻
 
-例子 1:
+例子 1：
 
 <question>埃菲尔铁塔有多高？</question>
 <thought>我需要找到埃菲尔铁塔的高度。可以使用搜索工具。</thought>
@@ -55,7 +58,7 @@ react_system_prompt_template = """
 
 ⸻
 
-例子 2:
+例子 2：
 
 <question>帮我找一个简单的番茄炒蛋食谱，并看看家里的冰箱里有没有西红柿。</question>
 <thought>这个任务分两步。第一步，找到番茄炒蛋的食谱。第二步，检查冰箱里是否有西红柿。我先用 find_recipe 工具找食谱。</thought>
@@ -80,7 +83,8 @@ react_system_prompt_template = """
 本次任务可用工具：
 ${tool_list}
 
-⸻
+可用技能目录（只展示轻量目录；当任务确实相关时，请调用 load_skill("skill-name") 按需加载正文）：
+${skill_list}
 
 环境信息：
 
@@ -104,6 +108,9 @@ subagent_system_prompt_template = """
 
 本次任务可用工具：
 ${tool_list}
+
+可用技能目录（只展示轻量目录；需要详细说明时再调用 load_skill("skill-name")）：
+${skill_list}
 
 环境信息：
 操作系统：${operating_system}

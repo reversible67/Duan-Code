@@ -1,3 +1,15 @@
+---
+name: write-tests
+description: 为指定文件或函数编写单元测试
+keywords:
+  - 写测试
+  - 单元测试
+  - 测试用例
+  - write test
+  - unit test
+  - 测试代码
+---
+
 # write-tests
 
 ## Description

@@ -16,7 +16,7 @@ from google import genai
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
-from skills import load_skills, match_skill
+from skills import get_skill_registry, match_skill
 
 
 class SubagentContext:
@@ -74,6 +74,7 @@ class ReActAgent:
         self.tools = { func.__name__: func for func in tools }
         self.model = model
         self.project_directory = project_directory
+        self.skill_registry = get_skill_registry()
         load_dotenv()
         if model.startswith("gemini"):
             proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -85,6 +86,7 @@ class ReActAgent:
                 self.client = genai.Client(api_key=self.get_api_key())
         else:
             self.client = None  # Ollama 模式不需要 Gemini client
+        self.tools["load_skill"] = self.load_skill
         # 子智能体可用工具集（不含 task，防递归）
         self.subagent_tools = { name: func for name, func in self.tools.items() if name != "task" }
         # 将 task 方法注册为工具，让父智能体可以调用子智能体
@@ -107,8 +109,8 @@ class ReActAgent:
 
     def run(self, user_input: str):
         original_task = user_input
-        skills = load_skills()
-        skill = None
+        selected_skill = None
+        hinted_skill = None
 
         # 显示会话历史摘要（若有）
         session_ctx = self._build_session_context()
@@ -119,38 +121,50 @@ class ReActAgent:
         if user_input.startswith("/"):
             parts = user_input[1:].split(None, 1)
             skill_name = parts[0]
-            skill = next((s for s in skills if s["name"] == skill_name), None)
-            if skill:
-                print(f"\n\n Slash 命令触发技能：/{skill['name']} — {skill.get('description', '')}")
-                user_input = parts[1] if len(parts) > 1 else skill.get("description", skill_name)
+            selected_skill = self.skill_registry.get_manifest(skill_name)
+            if selected_skill:
+                print(f"\n\n Slash 命令触发技能：/{selected_skill['name']} — {selected_skill.get('description', '')}")
+                user_input = parts[1] if len(parts) > 1 else selected_skill.get("description", skill_name)
             else:
-                print(f"\n\n 未找到技能 /{skill_name}，可用技能：{', '.join('/'+s['name'] for s in skills)}")
+                available = ', '.join('/' + s['name'] for s in self.skill_registry.list_manifests())
+                print(f"\n\n 未找到技能 /{skill_name}，可用技能：{available}")
                 return "未知 slash 命令"
 
         # 优先级2：关键词模糊匹配
-        if not skill:
-            skill = match_skill(user_input, skills)
-            if skill:
-                print(f"\n\n 匹配到技能：{skill['name']} — {skill.get('description', '')}")
+        if not selected_skill:
+            hinted_skill = match_skill(user_input, self.skill_registry.list_manifests())
+            if hinted_skill:
+                print(f"\n\n 匹配到相关技能：{hinted_skill['name']} — {hinted_skill.get('description', '')}")
 
-        if skill:
-            steps = skill["steps"]
-        else:
-            # 优先级3：LLM 规划
-            steps = self.plan(user_input)
+        skill_hint = ""
+        if selected_skill:
+            skill_hint = (
+                f"\n\n已显式选择技能：{selected_skill['name']}。"
+                f"开始执行前请先调用 load_skill(\"{selected_skill['name']}\") 读取技能正文，"
+                f"仅在需要时再用 read_file 读取该技能列出的附加资源。"
+            )
+        elif hinted_skill:
+            skill_hint = (
+                f"\n\n可能相关技能：{hinted_skill['name']}。"
+                f"如果它确实适用于当前任务，请先调用 load_skill(\"{hinted_skill['name']}\") 再继续执行。"
+            )
+
+        task_for_execution = f"{user_input}{skill_hint}"
+        steps = self.plan(task_for_execution)
         if not steps:
             print("\n\n 规划失败，降级为纯 ReAct 模式执行...")
-            result = self._react_loop(user_input, context=session_ctx)
+            result = self._react_loop(task_for_execution, context=session_ctx)
             self.session_history.append({"task": original_task, "answer": result})
             return result
 
         print("\n\n 执行计划：")
+
         for i, step in enumerate(steps, 1):
             print(f"  Step {i}: {step}")
         confirm = input("\n\n是否按此计划执行？（Y/N，直接回车确认）").strip().lower()
         if confirm == 'n':
             print("\n\n计划已取消，切换为直接对话模式...")
-            result = self._react_loop(user_input, context=session_ctx)
+            result = self._react_loop(task_for_execution, context=session_ctx)
             self.session_history.append({"task": original_task, "answer": result})
             return result
 
@@ -160,7 +174,7 @@ class ReActAgent:
             print(f"\n\n{'='*50}")
             print(f"▶️  执行 Step {i}/{len(steps)}: {step}")
             print(f"{'='*50}")
-            result = self.execute_step(step, context, user_input)
+            result = self.execute_step(step, context, task_for_execution)
             context += f"\n[Step {i} 结果] {result}"
 
         # 所有步骤完成后，让模型汇总最终答案
@@ -338,6 +352,15 @@ class ReActAgent:
         print(f"\n\n🔹 子智能体返回：{result[:100]}{'...' if len(result) > 100 else ''}")
         return result
 
+    def load_skill(self, name: str) -> str:
+        """按需加载技能正文，并仅披露附加资源目录"""
+        print(f"\n\n📚 加载技能：{name}")
+        return self.skill_registry.load_skill(name)
+
+    def get_skill_list(self) -> str:
+        """返回轻量技能目录，供系统提示词常驻展示"""
+        return self.skill_registry.describe_available()
+
     # 给 AI 生成工具使用说明书
     def get_tool_list(self) -> str:
         """生成工具列表字符串，包含函数签名和简要说明"""
@@ -358,13 +381,16 @@ class ReActAgent:
         转成绝对路径(完整路径，如 /user/project/main.py)
         """
         tool_list = self.get_tool_list()
+        skill_list = self.get_skill_list()
         file_list = ", ".join(
             os.path.abspath(os.path.join(self.project_directory, f))
             for f in os.listdir(self.project_directory)
         )
+        # 把一段带占位符的模板字符串，填上真实数据
         return Template(system_prompt_template).substitute(
             operating_system=self.get_operating_system_name(),
             tool_list=tool_list,
+            skill_list=skill_list,
             file_list=file_list
         )
         

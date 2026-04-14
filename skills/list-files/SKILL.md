@@ -1,3 +1,16 @@
+---
+name: list-files
+description: 列出项目中的文件，统计行数或按类型筛选
+keywords:
+  - 列出文件
+  - 列出所有文件
+  - 统计行数
+  - 文件列表
+  - list files
+  - 项目结构
+  - 目录结构
+---
+
 # list-files
 
 ## Description

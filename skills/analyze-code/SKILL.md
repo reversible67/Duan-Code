@@ -1,3 +1,15 @@
+---
+name: analyze-code
+description: 分析代码文件结构、质量和潜在问题
+keywords:
+  - 分析代码
+  - 代码分析
+  - 代码质量
+  - 代码审查
+  - review
+  - analyze code
+---
+
 # analyze-code
 
 ## Description
