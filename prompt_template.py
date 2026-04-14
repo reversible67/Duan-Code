@@ -7,6 +7,9 @@ ${tool_list}
 可用技能目录（这里只展示目录信息，不是技能正文）：
 ${skill_list}
 
+可用长期记忆（只作为方向提示，不替代当前观察）：
+${memory_section}
+
 环境信息：
 操作系统：${operating_system}
 当前目录下文件列表：${file_list}
@@ -86,8 +89,10 @@ ${tool_list}
 可用技能目录（只展示轻量目录；当任务确实相关时，请调用 load_skill("skill-name") 按需加载正文）：
 ${skill_list}
 
-环境信息：
+可用长期记忆（只作为方向提示，不替代当前观察）：
+${memory_section}
 
+环境信息：
 操作系统：${operating_system}
 当前目录下文件列表：${file_list}
 """
@@ -111,6 +116,9 @@ ${tool_list}
 
 可用技能目录（只展示轻量目录；需要详细说明时再调用 load_skill("skill-name")）：
 ${skill_list}
+
+可用长期记忆（只作为方向提示，不替代当前观察）：
+${memory_section}
 
 环境信息：
 操作系统：${operating_system}

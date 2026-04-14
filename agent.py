@@ -15,6 +15,7 @@ from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
+from memory import MemoryStore
 from hooks import HookRunner, build_default_hook_runner
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
 from skills import get_skill_registry, match_skill
@@ -81,6 +82,8 @@ class ReActAgent:
         self.hook_runner = hook_runner or build_default_hook_runner()
         self.session_started = False
         self.skill_registry = get_skill_registry()
+        self.memory_store = MemoryStore(os.path.join(self.project_directory, ".memory"))
+        self.current_memory_section = self.memory_store.build_memory_section()
         load_dotenv()
         if model.startswith("gemini"):
             proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -93,6 +96,7 @@ class ReActAgent:
         else:
             self.client = None  # Ollama 模式不需要 Gemini client
         self.tools["load_skill"] = self.load_skill
+        self.tools["save_memory"] = self.save_memory
         # 子智能体可用工具集（不含 task，防递归）
         self.subagent_tools = { name: func for name, func in self.tools.items() if name != "task" }
         # 将 task 方法注册为工具，让父智能体可以调用子智能体
@@ -118,6 +122,7 @@ class ReActAgent:
         selected_skill = None
         hinted_skill = None
         session_hook_message = ""
+        self.current_memory_section = self._load_memory_section(original_task)
 
         if not self.session_started:
             session_result = self.hook_runner.run("SessionStart", {
@@ -384,9 +389,30 @@ class ReActAgent:
         print(f"\n\n📚 加载技能：{name}")
         return self.skill_registry.load_skill(name)
 
+    def save_memory(self, name: str, description: str, mem_type: str, content: str) -> str:
+        print(f"\n\n🧠 保存长期记忆：{name} [{mem_type}]")
+        result = self.memory_store.save_memory(name, description, mem_type, content)
+        self.current_memory_section = self.memory_store.build_memory_section()
+        return result
+
     def get_skill_list(self) -> str:
         """返回轻量技能目录，供系统提示词常驻展示"""
         return self.skill_registry.describe_available()
+
+    def _should_ignore_memory(self, user_input: str) -> bool:
+        lowered = user_input.lower()
+        return (
+            "ignore memory" in lowered
+            or "忽略 memory" in user_input
+            or "忽略之前的记忆" in user_input
+            or "不要参考 memory" in user_input
+            or "忽略之前的memory" in lowered
+        )
+
+    def _load_memory_section(self, user_input: str) -> str:
+        if self._should_ignore_memory(user_input):
+            return "- 暂无可用长期记忆"
+        return self.memory_store.build_memory_section()
 
     # 给 AI 生成工具使用说明书
     def get_tool_list(self) -> str:
@@ -418,6 +444,7 @@ class ReActAgent:
             operating_system=self.get_operating_system_name(),
             tool_list=tool_list,
             skill_list=skill_list,
+            memory_section=getattr(self, "current_memory_section", "- 暂无可用长期记忆"),
             file_list=file_list
         )
         
