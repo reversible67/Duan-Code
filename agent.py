@@ -15,6 +15,7 @@ from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
+from hooks import HookRunner, build_default_hook_runner
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
 from skills import get_skill_registry, match_skill
 
@@ -56,24 +57,29 @@ class SubagentContext:
                 self.messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用：{available}</observation>"})
                 continue
 
-            try:
-                observation = self.tools[tool_name](*args)
-            except Exception as e:
-                observation = f"工具执行错误：{e}"
-
-            self.messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+            observation, should_stop = self.agent._run_tool_with_hooks(
+                tool_name,
+                args,
+                self.messages,
+                available_tools=self.tools,
+                cancel_message="子任务被取消",
+            )
+            if should_stop:
+                return observation
 
         return "子智能体达到最大轮数，未能完成任务"
 
 
 class ReActAgent:
     # Callable意味可调用的函数
-    def __init__(self, tools: List[Callable], model: str, project_directory: str):
+    def __init__(self, tools: List[Callable], model: str, project_directory: str, hook_runner: HookRunner | None = None):
         # 把传入的工具函数列表转成字典
         # key是函数名 values是函数本身  方便后续直接通过名字调用工具
         self.tools = { func.__name__: func for func in tools }
         self.model = model
         self.project_directory = project_directory
+        self.hook_runner = hook_runner or build_default_hook_runner()
+        self.session_started = False
         self.skill_registry = get_skill_registry()
         load_dotenv()
         if model.startswith("gemini"):
@@ -111,6 +117,18 @@ class ReActAgent:
         original_task = user_input
         selected_skill = None
         hinted_skill = None
+        session_hook_message = ""
+
+        if not self.session_started:
+            session_result = self.hook_runner.run("SessionStart", {
+                "user_input": original_task,
+                "project_directory": self.project_directory,
+            })
+            self.session_started = True
+            if session_result["exit_code"] == 1:
+                return session_result["message"] or "会话被 Hook 阻止"
+            if session_result["exit_code"] == 2:
+                session_hook_message = session_result["message"]
 
         # 显示会话历史摘要（若有）
         session_ctx = self._build_session_context()
@@ -150,6 +168,8 @@ class ReActAgent:
             )
 
         task_for_execution = f"{user_input}{skill_hint}"
+        if session_hook_message:
+            task_for_execution = f"{task_for_execution}\n\n{session_hook_message}"
         steps = self.plan(task_for_execution)
         if not steps:
             print("\n\n 规划失败，降级为纯 ReAct 模式执行...")
@@ -235,30 +255,9 @@ class ReActAgent:
                 messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\")。</observation>"})
                 continue
 
-            if tool_name not in self.tools:
-                available = ', '.join(self.tools.keys())
-                messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用工具：{available}</observation>"})
-                continue
-
-            # 路径边界校验：read_file/write_to_file 只允许操作项目目录内的文件
-            if tool_name in ("read_file", "write_to_file") and args:
-                if not self._validate_path(str(args[0])):
-                    observation = f"路径 '{args[0]}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
-                    print(f"\n\n Observation：{observation}")
-                    messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
-                    continue
-
-            print(f"\n\n Action: {tool_name}({', '.join(str(a) for a in args)})")
-            should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
-            if should_continue.lower() != 'y':
-                return "步骤被用户取消"
-
-            try:
-                observation = self.tools[tool_name](*args)
-            except Exception as e:
-                observation = f"工具执行错误：{str(e)}"
-            print(f"\n\n Observation：{observation}")
-            messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+            observation, should_stop = self._run_tool_with_hooks(tool_name, args, messages, cancel_message="步骤被用户取消")
+            if should_stop:
+                return observation
 
         return "步骤达到最大执行轮数"
 
@@ -298,32 +297,10 @@ class ReActAgent:
                 messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\")。</observation>"})
                 continue
 
-            if tool_name not in self.tools:
-                print(f"\n\n⚠️ 工具 {tool_name} 不存在，反馈重试...")
-                available = ', '.join(self.tools.keys())
-                messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用工具：{available}</observation>"})
-                continue
-
-            # 路径边界校验：read_file/write_to_file 只允许操作项目目录内的文件
-            if tool_name in ("read_file", "write_to_file") and args:
-                if not self._validate_path(str(args[0])):
-                    observation = f"路径 '{args[0]}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
-                    print(f"\n\n Observation：{observation}")
-                    messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
-                    continue
-
-            print(f"\n\n Action: {tool_name}({', '.join(str(a) for a in args)})")
-            should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
-            if should_continue.lower() != 'y':
+            observation, should_stop = self._run_tool_with_hooks(tool_name, args, messages, cancel_message="操作被用户取消")
+            if should_stop:
                 print("\n\n操作已取消。")
-                return "操作被用户取消"
-
-            try:
-                observation = self.tools[tool_name](*args)
-            except Exception as e:
-                observation = f"工具执行错误：{str(e)}"
-            print(f"\n\n Observation：{observation}")
-            messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+                return observation
 
         return "ReAct 循环达到最大执行轮数"
 
@@ -339,15 +316,65 @@ class ReActAgent:
         messages[:] = kept
         print(f"\n\n📦 历史已压缩，保留 {len(messages)} 条消息")
 
+    def _append_observation(self, messages: list, observation: str):
+        messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+
+    def _run_tool_with_hooks(self, tool_name: str, args: list, messages: list, available_tools: dict | None = None, cancel_message: str = "操作被用户取消") -> tuple[str, bool]:
+        tool_map = available_tools or self.tools
+
+        if tool_name not in tool_map:
+            available = ', '.join(tool_map.keys())
+            observation = f"工具 '{tool_name}' 不存在，可用工具：{available}"
+            self._append_observation(messages, observation)
+            return observation, False
+
+        if tool_name in ("read_file", "write_to_file") and args:
+            if not self._validate_path(str(args[0])):
+                observation = f"路径 '{args[0]}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
+                print(f"\n\n Observation：{observation}")
+                self._append_observation(messages, observation)
+                return observation, False
+
+        pre = self.hook_runner.run("PreToolUse", {
+            "tool_name": tool_name,
+            "input": {"args": args},
+        })
+        if pre["exit_code"] == 1:
+            observation = pre["message"] or f"Hook 阻止了工具 {tool_name} 的执行"
+            print(f"\n\n Observation：{observation}")
+            self._append_observation(messages, observation)
+            return observation, False
+        if pre["exit_code"] == 2 and pre["message"]:
+            self._append_observation(messages, pre["message"])
+
+        print(f"\n\n Action: {tool_name}({', '.join(str(a) for a in args)})")
+        should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
+        if should_continue.lower() != 'y':
+            return cancel_message, True
+
+        try:
+            observation = tool_map[tool_name](*args)
+        except Exception as e:
+            observation = f"工具执行错误：{str(e)}"
+
+        post = self.hook_runner.run("PostToolUse", {
+            "tool_name": tool_name,
+            "input": {"args": args},
+            "output": observation,
+        })
+        if post["exit_code"] == 1:
+            observation = post["message"] or observation
+        elif post["exit_code"] == 2 and post["message"]:
+            observation = f"{observation}\n\n{post['message']}"
+
+        print(f"\n\n Observation：{observation}")
+        self._append_observation(messages, observation)
+        return observation, False
+
     def task(self, prompt: str) -> str:
         """在独立上下文中执行子任务，返回结果摘要（不污染父上下文）"""
         print(f"\n\n🔹 派生子智能体：{prompt[:80]}{'...' if len(prompt) > 80 else ''}")
-        subagent = SubagentContext(
-            prompt=prompt,
-            tools=self.subagent_tools,
-            agent=self,
-            max_turns=8
-        )
+        subagent = SubagentContext(prompt=prompt, tools=self.subagent_tools, agent=self)
         result = subagent.run()
         print(f"\n\n🔹 子智能体返回：{result[:100]}{'...' if len(result) > 100 else ''}")
         return result

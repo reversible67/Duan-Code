@@ -48,6 +48,18 @@ def make_mock_agent(responses):
             return content
         def parse_action(self, code): return _simple_parse_action(code)
         def render_system_prompt(self, tpl): return "你是子智能体"
+        def _run_tool_with_hooks(self, tool_name, args, messages, available_tools=None, cancel_message="操作被用户取消"):
+            tool_map = available_tools or {}
+            if tool_name not in tool_map:
+                observation = f"工具 '{tool_name}' 不存在，可用工具：{', '.join(tool_map.keys())}"
+                messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+                return observation, False
+            try:
+                observation = tool_map[tool_name](*args)
+            except Exception as e:
+                observation = f"工具执行错误：{e}"
+            messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+            return observation, False
     return FakeAgent()
 
 def test_final_answer():
