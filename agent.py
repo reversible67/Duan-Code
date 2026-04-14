@@ -14,9 +14,57 @@ import platform                           # 获取系统信息：判断是Window
 from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
-from prompt_template import react_system_prompt_template, plan_system_prompt_template
+from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
 from skills import load_skills, match_skill
+
+
+class SubagentContext:
+    """子智能体上下文：独立消息列表 + 限制工具集 + 最大轮数保护"""
+    def __init__(self, prompt: str, tools: dict, agent: 'ReActAgent', max_turns: int = 8):
+        self.messages = [
+            {"role": "system", "content": agent.render_system_prompt(subagent_system_prompt_template)},
+            {"role": "user", "content": f"<question>{prompt}</question>"}
+        ]
+        self.tools = tools          # 子智能体可用工具（不含 task，防递归）
+        self.agent = agent          # 引用父智能体，用于调用 dispatch_model 等
+        self.max_turns = max_turns
+
+    def run(self) -> str:
+        """执行子智能体 ReAct 循环，返回结果摘要"""
+        for turn in range(self.max_turns):
+            content = self.agent.dispatch_model(self.messages)
+
+            if "<final_answer>" in content:
+                match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
+                return match.group(1).strip() if match else "子任务完成"
+
+            action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
+            if not action_match:
+                self.messages.append({"role": "user", "content": "<observation>格式错误：必须输出 <action>...</action>，请重新输出。</observation>"})
+                continue
+
+            action = action_match.group(1).strip()
+            try:
+                tool_name, args = self.agent.parse_action(action)
+            except Exception as e:
+                self.messages.append({"role": "user", "content": f"<observation>Action 解析失败：{e}</observation>"})
+                continue
+
+            if tool_name not in self.tools:
+                available = ', '.join(self.tools.keys())
+                self.messages.append({"role": "user", "content": f"<observation>工具 '{tool_name}' 不存在，可用：{available}</observation>"})
+                continue
+
+            try:
+                observation = self.tools[tool_name](*args)
+            except Exception as e:
+                observation = f"工具执行错误：{e}"
+
+            self.messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+
+        return "子智能体达到最大轮数，未能完成任务"
+
 
 class ReActAgent:
     # Callable意味可调用的函数
@@ -37,6 +85,10 @@ class ReActAgent:
                 self.client = genai.Client(api_key=self.get_api_key())
         else:
             self.client = None  # Ollama 模式不需要 Gemini client
+        # 子智能体可用工具集（不含 task，防递归）
+        self.subagent_tools = { name: func for name, func in self.tools.items() if name != "task" }
+        # 将 task 方法注册为工具，让父智能体可以调用子智能体
+        self.tools["task"] = self.task
         self.session_history: list[dict] = []  # 会话级记忆：记录本次启动中的所有任务和答案
     
     MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
@@ -273,6 +325,19 @@ class ReActAgent:
         messages[:] = kept
         print(f"\n\n📦 历史已压缩，保留 {len(messages)} 条消息")
 
+    def task(self, prompt: str) -> str:
+        """在独立上下文中执行子任务，返回结果摘要（不污染父上下文）"""
+        print(f"\n\n🔹 派生子智能体：{prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+        subagent = SubagentContext(
+            prompt=prompt,
+            tools=self.subagent_tools,
+            agent=self,
+            max_turns=8
+        )
+        result = subagent.run()
+        print(f"\n\n🔹 子智能体返回：{result[:100]}{'...' if len(result) > 100 else ''}")
+        return result
+
     # 给 AI 生成工具使用说明书
     def get_tool_list(self) -> str:
         """生成工具列表字符串，包含函数签名和简要说明"""
@@ -447,6 +512,11 @@ class ReActAgent:
             # 如果解析失败，返回原始字符串
             return arg_str
         
+    def _validate_path(self, file_path: str) -> bool:
+        """校验文件路径是否在项目目录内，防止越权访问"""
+        abs_path = os.path.abspath(file_path)
+        return abs_path.startswith(self.project_directory)
+
     def get_operating_system_name(self):
         os_map = {
             "Darwin": "macOS",
