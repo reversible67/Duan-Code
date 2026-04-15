@@ -4,7 +4,8 @@ import inspect                            # 检查函数、类、模块的信息
 import os                                 # 操作系统交互：读取环境变量、文件路径、创建文件夹等
 import re                                 # 正则表达式：文本查找、替换、匹配（比如提取关键词、过滤内容）
 from string import Template               # 字符串模板：方便批量替换文本中的变量
-from typing import List, Callable, Tuple  # 类型注解：标注变量/函数类型，让代码更易读、防错
+import sys
+from typing import Any, List, Callable, Tuple  # 类型注解：标注变量/函数类型，让代码更易读、防错
 
 # 2. 第三方库 (需要用pip安装才能使用)
 import click                              # 命令行工具：快速创建可在终端运行的命令、参数、选项
@@ -17,24 +18,25 @@ from google import genai
 from internal_mcp.client import MCPClientManager
 from internal_mcp.config import load_mcp_server_configs
 from internal_mcp.registry import MCPToolRegistry
-from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
+from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template, direct_answer_system_prompt_template
+
 from memory import MemoryStore
 from team import TeammateManager
 from hooks import HookRunner, build_default_hook_runner
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
 from skills import get_skill_registry, match_skill
 
-
 class SubagentContext:
     """子智能体上下文：独立消息列表 + 限制工具集 + 最大轮数保护"""
     def __init__(self, prompt: str, tools: dict, agent: 'ReActAgent', max_turns: int = 8):
         self.messages = [
-            {"role": "system", "content": agent.render_system_prompt(subagent_system_prompt_template)},
+            {"role": "system", "content": agent.render_system_prompt(subagent_system_prompt_template, tool_map=tools)},
             {"role": "user", "content": f"<question>{prompt}</question>"}
         ]
         self.tools = tools          # 子智能体可用工具（不含 task，防递归）
         self.agent = agent          # 引用父智能体，用于调用 dispatch_model 等
         self.max_turns = max_turns
+        self.tool_failures: dict[str, int] = {}
 
     def run(self) -> str:
         """执行子智能体 ReAct 循环，返回结果摘要"""
@@ -52,7 +54,7 @@ class SubagentContext:
 
             action = action_match.group(1).strip()
             try:
-                tool_name, args = self.agent.parse_action(action)
+                tool_name, args, kwargs = self.agent.parse_action(action)
             except Exception as e:
                 self.messages.append({"role": "user", "content": f"<observation>Action 解析失败：{e}</observation>"})
                 continue
@@ -65,12 +67,16 @@ class SubagentContext:
             observation, should_stop = self.agent._run_tool_with_hooks(
                 tool_name,
                 args,
+                kwargs,
                 self.messages,
                 available_tools=self.tools,
                 cancel_message="子任务被取消",
             )
             if should_stop:
                 return observation
+            recovery_result = self.agent._recover_from_tool_failure(tool_name, observation, self.tool_failures, self.messages)
+            if recovery_result is not None:
+                return recovery_result
 
         return "子智能体达到最大轮数，未能完成任务"
 
@@ -132,9 +138,22 @@ class ReActAgent:
         # 将 task 方法注册为工具，让父智能体可以调用子智能体
         self.tools["task"] = self.task
         self.session_history: list[dict] = []  # 会话级记忆：记录本次启动中的所有任务和答案
-    
+
     MAX_HISTORY_MESSAGES = 20  # 超过此数量时触发历史压缩（不含 system 消息）
     MAX_SESSION_HISTORY = 5  # 注入上下文时最多使用最近 N 条历史
+    TOOL_FAILURE_PREFIXES = ("工具执行错误：", "搜索失败：", "知识库查询失败：")
+    ALWAYS_HIDDEN_PROMPT_TOOLS = {"save_memory"}
+    TEAM_PROMPT_TOOLS = {
+        "task",
+        "spawn_teammate",
+        "list_teammates",
+        "send_message",
+        "broadcast_message",
+        "read_team_inbox",
+        "request_shutdown",
+        "review_plan",
+    }
+    GENERAL_QUESTION_TOOLS = {"web_search", "query_knowledge_base"}
 
     def _build_session_context(self) -> str:
         """将最近 N 条会话历史格式化为字符串，注入当前任务上下文"""
@@ -209,10 +228,16 @@ class ReActAgent:
         task_for_execution = f"{user_input}{skill_hint}"
         if session_hook_message:
             task_for_execution = f"{task_for_execution}\n\n{session_hook_message}"
-        steps = self.plan(task_for_execution)
+        prompt_tool_map = self._build_prompt_tool_map(task_for_execution, selected_skill, hinted_skill)
+        if self._should_skip_planning(task_for_execution):
+            print("\n\n 识别为通用问答，跳过任务规划，优先直接回答...")
+            result = self._direct_answer(task_for_execution)
+            self.session_history.append({"task": original_task, "answer": result})
+            return result
+        steps = self.plan(task_for_execution, tool_map=prompt_tool_map)
         if not steps:
             print("\n\n 规划失败，降级为纯 ReAct 模式执行...")
-            result = self._react_loop(task_for_execution, context=session_ctx)
+            result = self._react_loop(task_for_execution, context=session_ctx, tool_map=prompt_tool_map)
             self.session_history.append({"task": original_task, "answer": result})
             return result
 
@@ -223,7 +248,7 @@ class ReActAgent:
         confirm = input("\n\n是否按此计划执行？（Y/N，直接回车确认）").strip().lower()
         if confirm == 'n':
             print("\n\n计划已取消，切换为直接对话模式...")
-            result = self._react_loop(task_for_execution, context=session_ctx)
+            result = self._react_loop(task_for_execution, context=session_ctx, tool_map=prompt_tool_map)
             self.session_history.append({"task": original_task, "answer": result})
             return result
 
@@ -233,13 +258,13 @@ class ReActAgent:
             print(f"\n\n{'='*50}")
             print(f"▶️  执行 Step {i}/{len(steps)}: {step}")
             print(f"{'='*50}")
-            result = self.execute_step(step, context, task_for_execution)
+            result = self.execute_step(step, context, task_for_execution, tool_map=prompt_tool_map)
             context += f"\n[Step {i} 结果] {result}"
 
         # 所有步骤完成后，让模型汇总最终答案
         print("\n\n 所有步骤执行完成，正在汇总...")
         summary_messages = [
-            {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)},
+            {"role": "system", "content": self.render_system_prompt(react_system_prompt_template, tool_map=prompt_tool_map)},
             {"role": "user", "content": f"<question>{user_input}</question>\n\n以下是各步骤的执行结果摘要，请基于此给出最终答案：\n{context}\n\n请直接输出 <final_answer>...</final_answer>"}
         ]
         final_content = self.dispatch_model(summary_messages)
@@ -248,28 +273,30 @@ class ReActAgent:
         self.session_history.append({"task": original_task, "answer": final_answer})
         return final_answer
 
-    def plan(self, user_input: str) -> list:
+    def plan(self, user_input: str, tool_map: dict[str, Callable] | None = None) -> list:
         """调用一次 LLM 生成步骤列表，返回 step 字符串列表"""
         print("\n\n 正在规划任务步骤...")
         session_ctx = self._build_session_context()
         context_hint = f"\n\n{session_ctx}" if session_ctx else ""
         messages = [
-            {"role": "system", "content": self.render_system_prompt(plan_system_prompt_template)},
+            {"role": "system", "content": self.render_system_prompt(plan_system_prompt_template, tool_map=tool_map)},
             {"role": "user", "content": f"任务：{user_input}{context_hint}"}
         ]
         content = self.dispatch_model(messages)
         steps = re.findall(r"<step>(.*?)</step>", content, re.DOTALL)
         return [s.strip() for s in steps if s.strip()]
 
-    def execute_step(self, step: str, context: str, original_task: str) -> str:
+    def execute_step(self, step: str, context: str, original_task: str, tool_map: dict[str, Callable] | None = None) -> str:
         """用 ReAct 小循环执行单个步骤，最多 10 轮，返回执行结果摘要"""
         context_hint = f"\n\n前置步骤执行结果（供参考）：{context}" if context else ""
-        system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)}
+        available_tools = tool_map or self.tools
+        system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template, tool_map=available_tools)}
         messages = [
             system_msg,
             {"role": "user", "content": f"<question>总体任务：{original_task}\n\n当前步骤：{step}{context_hint}</question>"}
         ]
         max_rounds = 10
+        tool_failures: dict[str, int] = {}
         for _ in range(max_rounds):
             self._compress_history(messages)
             content = self.dispatch_model(messages)
@@ -289,27 +316,32 @@ class ReActAgent:
 
             action = action_match.group(1).strip()
             try:
-                tool_name, args = self.parse_action(action)
+                tool_name, args, kwargs = self.parse_action(action)
             except Exception as e:
-                messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\")。</observation>"})
+                messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\") 或 tool_name(name=\"value\")。</observation>"})
                 continue
 
-            observation, should_stop = self._run_tool_with_hooks(tool_name, args, messages, cancel_message="步骤被用户取消")
+            observation, should_stop = self._run_tool_with_hooks(tool_name, args, kwargs, messages, available_tools=available_tools, cancel_message="步骤被用户取消")
             if should_stop:
                 return observation
+            recovery_result = self._recover_from_tool_failure(tool_name, observation, tool_failures, messages)
+            if recovery_result is not None:
+                return recovery_result
 
         return "步骤达到最大执行轮数"
 
-    def _react_loop(self, user_input: str, context: str) -> str:
+    def _react_loop(self, user_input: str, context: str, tool_map: dict[str, Callable] | None = None) -> str:
         """原始 ReAct 单循环，作为降级兜底"""
         context_hint = f"\n\n{context}" if context else ""
-        system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)}
+        available_tools = tool_map or self.tools
+        system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template, tool_map=available_tools)}
         messages = [
             system_msg,
             {"role": "user", "content": f"<question>{user_input}</question>{context_hint}"}
         ]
 
         max_rounds = 15
+        tool_failures: dict[str, int] = {}
         for _ in range(max_rounds):
             self._compress_history(messages)
             content = self.dispatch_model(messages)
@@ -319,8 +351,8 @@ class ReActAgent:
                 print(f"\n\n💭 Thought: {thought_match.group(1).strip()}")
 
             if "<final_answer>" in content:
-                final_answer = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
-                return final_answer.group(1)
+                final_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
+                return final_match.group(1).strip() if final_match else "步骤完成"
 
             action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
             if not action_match:
@@ -330,16 +362,19 @@ class ReActAgent:
 
             action = action_match.group(1).strip()
             try:
-                tool_name, args = self.parse_action(action)
+                tool_name, args, kwargs = self.parse_action(action)
             except Exception as e:
                 print(f"\n\n⚠️ Action 解析失败：{e}，反馈重试...")
-                messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\")。</observation>"})
+                messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\") 或 tool_name(name=\"value\")。</observation>"})
                 continue
 
-            observation, should_stop = self._run_tool_with_hooks(tool_name, args, messages, cancel_message="操作被用户取消")
+            observation, should_stop = self._run_tool_with_hooks(tool_name, args, kwargs, messages, available_tools=available_tools, cancel_message="操作被用户取消")
             if should_stop:
                 print("\n\n操作已取消。")
                 return observation
+            recovery_result = self._recover_from_tool_failure(tool_name, observation, tool_failures, messages)
+            if recovery_result is not None:
+                return recovery_result
 
         return "ReAct 循环达到最大执行轮数"
 
@@ -358,8 +393,9 @@ class ReActAgent:
     def _append_observation(self, messages: list, observation: str):
         messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
 
-    def _run_tool_with_hooks(self, tool_name: str, args: list, messages: list, available_tools: dict | None = None, cancel_message: str = "操作被用户取消") -> tuple[str, bool]:
+    def _run_tool_with_hooks(self, tool_name: str, args: list, kwargs: dict[str, Any] | None, messages: list, available_tools: dict | None = None, cancel_message: str = "操作被用户取消") -> tuple[str, bool]:
         tool_map = available_tools or self.tools
+        kwargs = kwargs or {}
 
         if tool_name not in tool_map:
             available = ', '.join(tool_map.keys())
@@ -367,16 +403,17 @@ class ReActAgent:
             self._append_observation(messages, observation)
             return observation, False
 
-        if tool_name in ("read_file", "write_to_file") and args:
-            if not self._validate_path(str(args[0])):
-                observation = f"路径 '{args[0]}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
+        file_path = self._extract_path_argument(tool_name, args, kwargs)
+        if file_path is not None and tool_name in ("read_file", "write_to_file"):
+            if not self._validate_path(str(file_path)):
+                observation = f"路径 '{file_path}' 不在项目目录内，只允许操作 {self.project_directory} 下的文件"
                 print(f"\n\n Observation：{observation}")
                 self._append_observation(messages, observation)
                 return observation, False
 
         pre = self.hook_runner.run("PreToolUse", {
             "tool_name": tool_name,
-            "input": {"args": args},
+            "input": {"args": args, "kwargs": kwargs},
         })
         if pre["exit_code"] == 1:
             observation = pre["message"] or f"Hook 阻止了工具 {tool_name} 的执行"
@@ -386,19 +423,19 @@ class ReActAgent:
         if pre["exit_code"] == 2 and pre["message"]:
             self._append_observation(messages, pre["message"])
 
-        print(f"\n\n Action: {tool_name}({', '.join(str(a) for a in args)})")
+        print(f"\n\n Action: {self._format_action_call(tool_name, args, kwargs)}")
         should_continue = input("\n\n是否继续？（Y/N）") if tool_name == "run_terminal_command" else "y"
         if should_continue.lower() != 'y':
             return cancel_message, True
 
         try:
-            observation = tool_map[tool_name](*args)
+            observation = tool_map[tool_name](*args, **kwargs)
         except Exception as e:
             observation = f"工具执行错误：{str(e)}"
 
         post = self.hook_runner.run("PostToolUse", {
             "tool_name": tool_name,
-            "input": {"args": args},
+            "input": {"args": args, "kwargs": kwargs},
             "output": observation,
         })
         if post["exit_code"] == 1:
@@ -409,6 +446,29 @@ class ReActAgent:
         print(f"\n\n Observation：{observation}")
         self._append_observation(messages, observation)
         return observation, False
+
+    def _is_tool_failure(self, observation: str) -> bool:
+        if observation.startswith(self.TOOL_FAILURE_PREFIXES):
+            return True
+        return "不在项目目录内" in observation or observation.startswith("工具 '")
+
+    def _recover_from_tool_failure(self, tool_name: str, observation: str, failure_counts: dict[str, int], messages: list) -> str | None:
+        if not self._is_tool_failure(observation):
+            return None
+        failure_counts[tool_name] = failure_counts.get(tool_name, 0) + 1
+        if failure_counts[tool_name] < 2:
+            return None
+        recovery_observation = (
+            f"工具 '{tool_name}' 已连续失败 {failure_counts[tool_name]} 次。"
+            f"最后一次错误：{observation}。"
+            "不要继续重试同一个工具或同类失败工具；如果已有信息足够，请直接输出 <final_answer>；否则明确说明缺失信息和下一步建议。"
+        )
+        self._append_observation(messages, recovery_observation)
+        content = self.dispatch_model(messages)
+        final_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
+        if final_match:
+            return final_match.group(1).strip()
+        return recovery_observation
 
     def task(self, prompt: str) -> str:
         """在独立上下文中执行子任务，返回结果摘要（不污染父上下文）"""
@@ -429,9 +489,72 @@ class ReActAgent:
         self.current_memory_section = self.memory_store.build_memory_section()
         return result
 
-    def get_skill_list(self) -> str:
-        """返回轻量技能目录，供系统提示词常驻展示"""
-        return self.skill_registry.describe_available()
+    def _is_general_question(self, user_input: str) -> bool:
+        lowered = user_input.lower()
+        project_markers = (
+            "代码", "文件", "目录", "项目", "仓库", "函数", "类", "模块", "bug", "报错",
+            "测试", "运行", "实现", "修改", "重构", "调试", "read_file", "write_to_file",
+            ".py", "agent.py", "tools.py", "搜索项目", "查看仓库",
+        )
+        general_markers = (
+            "什么", "如何", "为什么", "建议", "学习", "知识", "路线", "介绍", "区别",
+            "原理", "概念", "怎么", "需要补充", "我想转", "适合", "总结",
+        )
+        return any(marker in user_input or marker in lowered for marker in general_markers) and not any(marker in user_input or marker in lowered for marker in project_markers)
+
+    def _should_skip_planning(self, user_input: str) -> bool:
+        return self._is_general_question(user_input)
+
+    def _direct_answer(self, user_input: str) -> str:
+        messages = [
+            {"role": "system", "content": self.render_system_prompt(direct_answer_system_prompt_template)},
+            {"role": "user", "content": f"<question>{user_input}</question>"},
+        ]
+        content = self.dispatch_model(messages)
+        final_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
+        if final_match:
+            return final_match.group(1).strip()
+        return content.strip()
+
+    def _is_multi_agent_request(self, user_input: str) -> bool:
+        lowered = user_input.lower()
+        markers = ("multi-agent", "multi agent", "多 agent", "多智能体", "队友", "researcher", "coder", "tester")
+        return any(marker in lowered or marker in user_input for marker in markers)
+
+    def _build_prompt_tool_map(self, user_input: str, selected_skill: dict | None = None, hinted_skill: dict | None = None) -> dict[str, Callable]:
+        if self._is_general_question(user_input):
+            general_tools = {
+                name: func
+                for name, func in self.tools.items()
+                if name in self.GENERAL_QUESTION_TOOLS
+            }
+            return general_tools or dict(self.tools)
+
+        hidden_tools = set(self.ALWAYS_HIDDEN_PROMPT_TOOLS)
+        if not self._is_multi_agent_request(user_input):
+            hidden_tools.update(self.TEAM_PROMPT_TOOLS)
+        if not selected_skill and not hinted_skill:
+            hidden_tools.add("load_skill")
+
+        return {
+            name: func
+            for name, func in self.tools.items()
+            if name not in hidden_tools
+        }
+
+    def _extract_path_argument(self, tool_name: str, args: list, kwargs: dict[str, Any]) -> str | None:
+        if tool_name not in ("read_file", "write_to_file"):
+            return None
+        if "file_path" in kwargs:
+            return str(kwargs["file_path"])
+        if args:
+            return str(args[0])
+        return None
+
+    def _format_action_call(self, tool_name: str, args: list, kwargs: dict[str, Any]) -> str:
+        parts = [repr(arg) for arg in args]
+        parts.extend(f"{key}={repr(value)}" for key, value in kwargs.items())
+        return f"{tool_name}({', '.join(parts)})"
 
     def spawn_teammate(self, name: str, role: str, prompt: str) -> str:
         return self.team_manager.spawn(name, role, prompt)
@@ -574,6 +697,10 @@ class ReActAgent:
             return "- 暂无可用长期记忆"
         return self.memory_store.build_memory_section()
 
+    def get_skill_list(self) -> str:
+        """返回轻量技能目录，供系统提示词常驻展示"""
+        return self.skill_registry.describe_available()
+
     # 给 AI 生成工具使用说明书
     def get_tool_list(self, tool_map: dict | None = None) -> str:
         """生成工具列表字符串，包含函数签名和简要说明"""
@@ -684,60 +811,38 @@ class ReActAgent:
         messages.append({"role": "assistant", "content": content})
         return content
     
-    def parse_action(self, code_str: str) -> Tuple[str, List[str]]:
-        match = re.match(r'(\w+)\((.*)\)', code_str, re.DOTALL)
-        if not match:
-            raise ValueError("Invalid function call syntax")
+    def parse_action(self, code_str: str) -> Tuple[str, list[Any], dict[str, Any]]:
+        try:
+            expression = ast.parse(code_str, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(f"Invalid function call syntax: {exc.msg}") from exc
 
-        func_name = match.group(1)
-        args_str = match.group(2).strip()
+        call = expression.body
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+            raise ValueError("Action 必须是函数调用，例如 tool_name(\"arg\")")
 
-        # 手动解析参数，特别处理包含多行内容的字符串
-        args = []
-        current_arg = ""
-        in_string = False
-        string_char = None
-        i = 0
-        paren_depth = 0
-        
-        while i < len(args_str):
-            char = args_str[i]
-            
-            if not in_string:
-                if char in ['"', "'"]:
-                    in_string = True
-                    string_char = char
-                    current_arg += char
-                elif char == '(':
-                    paren_depth += 1
-                    current_arg += char
-                elif char == ')':
-                    paren_depth -= 1
-                    current_arg += char
-                elif char == ',' and paren_depth == 0:
-                    # 遇到顶层逗号，结束当前参数
-                    args.append(self._parse_single_arg(current_arg.strip()))
-                    current_arg = ""
-                else:
-                    current_arg += char
-            else:
-                current_arg += char
-                if char == string_char and (i == 0 or args_str[i-1] != '\\'):
-                    in_string = False
-                    string_char = None
-            
-            i += 1
-        
-        # 添加最后一个参数
-        if current_arg.strip():
-            args.append(self._parse_single_arg(current_arg.strip()))
-        
-        return func_name, args
+        func_name = call.func.id
+        args = [self._parse_action_value(code_str, arg) for arg in call.args]
+        kwargs: dict[str, Any] = {}
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                raise ValueError("暂不支持 **kwargs 展开")
+            kwargs[keyword.arg] = self._parse_action_value(code_str, keyword.value)
+
+        return func_name, args, kwargs
+
+    def _parse_action_value(self, source: str, node: ast.AST):
+        try:
+            return ast.literal_eval(node)
+        except (ValueError, SyntaxError):
+            raw = ast.get_source_segment(source, node)
+            if raw is None:
+                raise ValueError("参数必须是可解析的字面量")
+            return self._parse_single_arg(raw)
     
     def _parse_single_arg(self, arg_str: str):
         """解析单个参数"""
         arg_str = arg_str.strip()
-        
         # 如果是字符串字面量
         if (arg_str.startswith('"') and arg_str.endswith('"')) or \
            (arg_str.startswith("'") and arg_str.endswith("'")):
@@ -778,6 +883,11 @@ class ReActAgent:
               help='模型名称。gemini-* 使用 Google API；其他值（如 qwen2.5:3b）通过 Ollama 本地运行')
 def main(project_directory, model):
     project_dir = os.path.abspath(project_directory)
+    if os.name == "nt":
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     tools = [read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base]
     agent = ReActAgent(tools=tools, model=model, project_directory=project_dir)

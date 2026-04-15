@@ -79,6 +79,48 @@ def test_get_status_includes_mcp_section_and_teammates_exclude_mcp_tools():
     assert "read_file" in teammate_tools
 
 
+def test_parse_action_supports_named_arguments_and_literal_dicts():
+    agent = ReActAgent.__new__(ReActAgent)
+    agent.parse_action = ReActAgent.parse_action.__get__(agent, ReActAgent)
+    agent._parse_action_value = ReActAgent._parse_action_value.__get__(agent, ReActAgent)
+    agent._parse_single_arg = ReActAgent._parse_single_arg.__get__(agent, ReActAgent)
+
+    tool_name, args, kwargs = agent.parse_action('search_in_files(keyword="TODO", directory="E:/Duan-Code")')
+    assert tool_name == "search_in_files"
+    assert args == []
+    assert kwargs == {"keyword": "TODO", "directory": "E:/Duan-Code"}
+
+    tool_name, args, kwargs = agent.parse_action('mcp_repo_intel_find_symbol({"symbol_name": "ReActAgent"})')
+    assert tool_name == "mcp_repo_intel_find_symbol"
+    assert args == [{"symbol_name": "ReActAgent"}]
+    assert kwargs == {}
+
+
+def test_general_question_prompt_tool_map_is_restricted():
+    agent = ReActAgent.__new__(ReActAgent)
+    agent.tools = {
+        "read_file": lambda path: path,
+        "web_search": lambda query, max_results=3: query,
+        "query_knowledge_base": lambda question, top_k=3: question,
+        "save_memory": lambda name, description, mem_type, content: content,
+        "task": lambda prompt: prompt,
+    }
+    agent.ALWAYS_HIDDEN_PROMPT_TOOLS = {"save_memory"}
+    agent.TEAM_PROMPT_TOOLS = {"task"}
+    agent.GENERAL_QUESTION_TOOLS = {"web_search", "query_knowledge_base"}
+    agent._is_general_question = ReActAgent._is_general_question.__get__(agent, ReActAgent)
+    agent._should_skip_planning = ReActAgent._should_skip_planning.__get__(agent, ReActAgent)
+    agent._is_multi_agent_request = ReActAgent._is_multi_agent_request.__get__(agent, ReActAgent)
+    agent._build_prompt_tool_map = ReActAgent._build_prompt_tool_map.__get__(agent, ReActAgent)
+
+    prompt_tools = agent._build_prompt_tool_map("我想转agent开发，我需要补充什么知识？")
+
+    assert set(prompt_tools) == {"web_search", "query_knowledge_base"}
+    assert agent._should_skip_planning("我想转agent开发，我需要补充什么知识？") is True
+
+
 if __name__ == "__main__":
     test_get_status_includes_mcp_section_and_teammates_exclude_mcp_tools()
+    test_parse_action_supports_named_arguments_and_literal_dicts()
+    test_general_question_prompt_tool_map_is_restricted()
     print("✅ test_agent_mcp 通过")

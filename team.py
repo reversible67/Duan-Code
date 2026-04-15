@@ -215,12 +215,14 @@ class TeammateManager:
         ]
         idle = False
         turns = 0
+        tool_failures: dict[str, int] = {}
         while not self.shutdown_flags.get(name, False):
             inbox_messages = self.bus.read_inbox(name)
             if inbox_messages:
                 messages.append({"role": "user", "content": f"<inbox>{self._build_inbox_observation(inbox_messages)}</inbox>"})
                 idle = False
                 turns = 0
+                tool_failures = {}
                 self._set_status(name, "working")
             elif idle:
                 time.sleep(self.idle_sleep)
@@ -254,7 +256,7 @@ class TeammateManager:
 
             action = action_match.group(1).strip()
             try:
-                tool_name, args = self.agent.parse_action(action)
+                tool_name, args, kwargs = self.agent.parse_action(action)
             except Exception as e:
                 messages.append({"role": "user", "content": f"<observation>Action 解析失败：{e}</observation>"})
                 continue
@@ -262,6 +264,7 @@ class TeammateManager:
             observation, should_stop = self.agent._run_tool_with_hooks(
                 tool_name,
                 args,
+                kwargs,
                 messages,
                 available_tools=tools,
                 cancel_message="队友任务被取消",
@@ -271,6 +274,14 @@ class TeammateManager:
                 self._set_status(name, "idle")
                 idle = True
                 turns = 0
+                continue
+            recovery_result = self.agent._recover_from_tool_failure(tool_name, observation, tool_failures, messages)
+            if recovery_result is not None:
+                self.bus.send(name, "lead", recovery_result, "task_result")
+                self._set_status(name, "idle")
+                idle = True
+                turns = 0
+                tool_failures = {}
                 continue
 
         self._set_status(name, "shutdown")

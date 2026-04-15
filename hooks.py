@@ -60,7 +60,8 @@ def pre_tool_guard(event: HookEvent) -> HookResult:
     if event.payload.get("tool_name") != "run_terminal_command":
         return HookResult()
     args = event.payload.get("input", {}).get("args", [])
-    command = args[0] if args else ""
+    kwargs = event.payload.get("input", {}).get("kwargs", {})
+    command = kwargs.get("command", args[0] if args else "")
     if isinstance(command, str) and not command.strip():
         return HookResult(exit_code=EXIT_BLOCK, message="Hook 已阻止空命令执行")
     return HookResult()
