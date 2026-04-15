@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.2.1",
+    "mcp>=1.7.1",
     "openai>=1.91.0",
     "python-dotenv>=1.1.1",
     "gradio>=4.0.0",

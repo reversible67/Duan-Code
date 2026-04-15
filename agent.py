@@ -14,6 +14,9 @@ import platform                           # 获取系统信息：判断是Window
 from google import genai
 
 # 3. 自定义模块 (项目中自己写的)
+from internal_mcp.client import MCPClientManager
+from internal_mcp.config import load_mcp_server_configs
+from internal_mcp.registry import MCPToolRegistry
 from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
 from memory import MemoryStore
 from team import TeammateManager
@@ -86,6 +89,9 @@ class ReActAgent:
         self.memory_store = MemoryStore(os.path.join(self.project_directory, ".memory"))
         self.current_memory_section = self.memory_store.build_memory_section()
         self.team_manager = TeammateManager(os.path.join(self.project_directory, ".team"), self)
+        self.mcp_client_manager = MCPClientManager()
+        self.mcp_registry = MCPToolRegistry(self.mcp_client_manager)
+        self.mcp_server_configs = load_mcp_server_configs(self.project_directory)
         load_dotenv()
         if model.startswith("gemini"):
             proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -107,6 +113,7 @@ class ReActAgent:
         self.tools["get_status"] = self.get_status
         self.tools["request_shutdown"] = self.request_shutdown
         self.tools["review_plan"] = self.review_plan
+        self.tools.update(self._load_mcp_tools())
         excluded_subagent_tools = {
             "task",
             "spawn_teammate",
@@ -117,7 +124,11 @@ class ReActAgent:
             "request_shutdown",
             "review_plan",
         }
-        self.subagent_tools = { name: func for name, func in self.tools.items() if name not in excluded_subagent_tools }
+        self.subagent_tools = {
+            name: func
+            for name, func in self.tools.items()
+            if name not in excluded_subagent_tools and not self._is_mcp_tool(name)
+        }
         # 将 task 方法注册为工具，让父智能体可以调用子智能体
         self.tools["task"] = self.task
         self.session_history: list[dict] = []  # 会话级记忆：记录本次启动中的所有任务和答案
@@ -437,6 +448,28 @@ class ReActAgent:
     def read_team_inbox(self, name: str = "lead") -> str:
         return self.team_manager.read_inbox(name)
 
+    def _load_mcp_tools(self) -> dict[str, Callable]:
+        tool_specs = self.mcp_client_manager.load_servers(self.mcp_server_configs)
+        return self.mcp_registry.load_tools(tool_specs)
+
+    def _is_mcp_tool(self, tool_name: str) -> bool:
+        return self.mcp_registry.is_mcp_tool(tool_name)
+
+    def _get_mcp_status_lines(self) -> list[str]:
+        states = self.mcp_client_manager.get_server_states()
+        connected = sum(1 for state in states if state.connected)
+        lines = [
+            "# MCP Status",
+            f"- 已配置 server：{len(self.mcp_server_configs)}",
+            f"- 已连接 server：{connected}",
+            f"- 已加载 MCP tools：{len(self.mcp_registry.get_tool_specs())}",
+        ]
+        for state in states:
+            status = "connected" if state.connected else "disconnected"
+            detail = f", last_error={state.last_error}" if state.last_error else ""
+            lines.append(f"- server {state.name}: {status}, tools={state.tool_count}{detail}")
+        return lines
+
     def get_status(self) -> str:
         members = self.team_manager.config.get("members", [])
         active = [member for member in members if member["status"] == "working"]
@@ -457,6 +490,7 @@ class ReActAgent:
             f"- 待审批计划：{pending_plan}",
             "- 可用团队命令：/status, /team, /inbox [name]",
         ]
+        lines.extend(["", *self._get_mcp_status_lines()])
         return "\n".join(lines)
 
     def get_multi_agent_usage_guide(self) -> str:
@@ -467,6 +501,7 @@ class ReActAgent:
             "- 查看当前状态：/status\n"
             "- 查看团队成员：/team\n"
             "- 查看收件箱：/inbox 或 /inbox alice\n"
+            "- 如需接入外部 MCP server，请在项目目录下准备 .mcp/config.json\n"
         )
 
     def request_shutdown(self, teammate: str) -> str:
@@ -506,7 +541,7 @@ class ReActAgent:
             "review_plan",
             "send_message",
         }
-        tools = {name: func for name, func in self.tools.items() if name not in excluded}
+        tools = {name: func for name, func in self.tools.items() if name not in excluded and not self._is_mcp_tool(name)}
         tools["send_message"] = self._make_bound_tool(
             "send_message",
             "向领导或其他队友发送消息。",

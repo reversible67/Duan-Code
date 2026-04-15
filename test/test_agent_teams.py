@@ -37,6 +37,7 @@ def test_build_teammate_tools_binds_sender_and_protocol_tools():
         "send_message": lambda teammate, content, msg_type="message": content,
     }
     agent.team_manager = StubTeamManager()
+    agent._is_mcp_tool = lambda tool_name: False
     agent._make_bound_tool = ReActAgent._make_bound_tool.__get__(agent, ReActAgent)
     agent.build_teammate_tools = ReActAgent.build_teammate_tools.__get__(agent, ReActAgent)
 

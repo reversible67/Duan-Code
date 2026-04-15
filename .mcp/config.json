@@ -1,0 +1,17 @@
+{
+  "servers": [
+    {
+      "name": "repo_intel",
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "internal_mcp/servers/repo_intel_server.py"
+      ],
+      "env": {
+        "MCP_REPO_ROOT": "../"
+      },
+      "enabled": true,
+      "timeout_seconds": 30
+    }
+  ]
+}
