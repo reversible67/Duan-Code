@@ -16,6 +16,7 @@ from google import genai
 # 3. 自定义模块 (项目中自己写的)
 from prompt_template import react_system_prompt_template, plan_system_prompt_template, subagent_system_prompt_template
 from memory import MemoryStore
+from team import TeammateManager
 from hooks import HookRunner, build_default_hook_runner
 from tools import read_file, write_to_file, run_terminal_command, list_directory, search_in_files, web_search, query_knowledge_base
 from skills import get_skill_registry, match_skill
@@ -84,6 +85,7 @@ class ReActAgent:
         self.skill_registry = get_skill_registry()
         self.memory_store = MemoryStore(os.path.join(self.project_directory, ".memory"))
         self.current_memory_section = self.memory_store.build_memory_section()
+        self.team_manager = TeammateManager(os.path.join(self.project_directory, ".team"), self)
         load_dotenv()
         if model.startswith("gemini"):
             proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -97,8 +99,24 @@ class ReActAgent:
             self.client = None  # Ollama 模式不需要 Gemini client
         self.tools["load_skill"] = self.load_skill
         self.tools["save_memory"] = self.save_memory
-        # 子智能体可用工具集（不含 task，防递归）
-        self.subagent_tools = { name: func for name, func in self.tools.items() if name != "task" }
+        self.tools["spawn_teammate"] = self.spawn_teammate
+        self.tools["list_teammates"] = self.list_teammates
+        self.tools["send_message"] = self.send_message
+        self.tools["broadcast_message"] = self.broadcast_message
+        self.tools["read_team_inbox"] = self.read_team_inbox
+        self.tools["request_shutdown"] = self.request_shutdown
+        self.tools["review_plan"] = self.review_plan
+        excluded_subagent_tools = {
+            "task",
+            "spawn_teammate",
+            "list_teammates",
+            "send_message",
+            "broadcast_message",
+            "read_team_inbox",
+            "request_shutdown",
+            "review_plan",
+        }
+        self.subagent_tools = { name: func for name, func in self.tools.items() if name not in excluded_subagent_tools }
         # 将 task 方法注册为工具，让父智能体可以调用子智能体
         self.tools["task"] = self.task
         self.session_history: list[dict] = []  # 会话级记忆：记录本次启动中的所有任务和答案
@@ -139,6 +157,10 @@ class ReActAgent:
         session_ctx = self._build_session_context()
         if session_ctx:
             print(f"\n\n 会话记忆已加载（{len(self.session_history)} 条历史）")
+
+        special_command_result = self._handle_special_command(user_input)
+        if special_command_result is not None:
+            return special_command_result
 
         # 优先级1：slash 命令精确触发（/skill-name [可选附加描述]）
         if user_input.startswith("/"):
@@ -399,6 +421,73 @@ class ReActAgent:
         """返回轻量技能目录，供系统提示词常驻展示"""
         return self.skill_registry.describe_available()
 
+    def spawn_teammate(self, name: str, role: str, prompt: str) -> str:
+        return self.team_manager.spawn(name, role, prompt)
+
+    def list_teammates(self) -> str:
+        return self.team_manager.list_teammates()
+
+    def send_message(self, teammate: str, content: str, msg_type: str = "message") -> str:
+        return self.team_manager.send_message("lead", teammate, content, msg_type)
+
+    def broadcast_message(self, content: str, msg_type: str = "message") -> str:
+        return self.team_manager.broadcast_message("lead", content, msg_type)
+
+    def read_team_inbox(self, name: str = "lead") -> str:
+        return self.team_manager.read_inbox(name)
+
+    def request_shutdown(self, teammate: str) -> str:
+        return self.team_manager.request_shutdown(teammate)
+
+    def review_plan(self, request_id: str, approve: bool, feedback: str = "") -> str:
+        return self.team_manager.review_plan(request_id, approve, feedback)
+
+    def _handle_special_command(self, user_input: str) -> str | None:
+        if not user_input.startswith("/"):
+            return None
+        parts = user_input.split(None, 1)
+        command = parts[0].lower()
+        if command == "/team":
+            return self.list_teammates()
+        if command == "/inbox":
+            target = parts[1].strip() if len(parts) > 1 else "lead"
+            return self.read_team_inbox(target)
+        return None
+
+    def _make_bound_tool(self, name: str, doc: str, func: Callable) -> Callable:
+        func.__name__ = name
+        func.__doc__ = doc
+        return func
+
+    def build_teammate_tools(self, teammate_name: str) -> dict[str, Callable]:
+        excluded = {
+            "task",
+            "spawn_teammate",
+            "list_teammates",
+            "broadcast_message",
+            "read_team_inbox",
+            "request_shutdown",
+            "review_plan",
+            "send_message",
+        }
+        tools = {name: func for name, func in self.tools.items() if name not in excluded}
+        tools["send_message"] = self._make_bound_tool(
+            "send_message",
+            "向领导或其他队友发送消息。",
+            lambda to, content, msg_type="message": self.team_manager.send_message(teammate_name, to, content, msg_type),
+        )
+        tools["respond_shutdown"] = self._make_bound_tool(
+            "respond_shutdown",
+            "响应领导发来的 shutdown request。",
+            lambda request_id, approve, reason="": self.team_manager.respond_shutdown(teammate_name, request_id, approve, reason),
+        )
+        tools["submit_plan"] = self._make_bound_tool(
+            "submit_plan",
+            "向领导提交计划审批请求。",
+            lambda plan: self.team_manager.submit_plan(teammate_name, plan),
+        )
+        return tools
+
     def _should_ignore_memory(self, user_input: str) -> bool:
         lowered = user_input.lower()
         return (
@@ -415,10 +504,11 @@ class ReActAgent:
         return self.memory_store.build_memory_section()
 
     # 给 AI 生成工具使用说明书
-    def get_tool_list(self) -> str:
+    def get_tool_list(self, tool_map: dict | None = None) -> str:
         """生成工具列表字符串，包含函数签名和简要说明"""
         tool_descriptions = []
-        for func in self.tools.values():
+        tools = tool_map or self.tools
+        for func in tools.values():
             name = func.__name__
             signature = str(inspect.signature(func))
             doc = inspect.getdoc(func)
@@ -426,27 +516,30 @@ class ReActAgent:
         return "\n".join(tool_descriptions)
     
     # 返回一段完整 Ready-to-use 的 AI 系统提示词
-    def render_system_prompt(self, system_prompt_template: str) -> str:
+    def render_system_prompt(self, system_prompt_template: str, tool_map: dict | None = None, extra_vars: dict | None = None) -> str:
         """渲染系统提示模板，替换变量"""
         """
         os.listdir(self.project_directory)  列出项目文件夹里所有文件名
         os.path.join(路径, 文件名)
         转成绝对路径(完整路径，如 /user/project/main.py)
         """
-        tool_list = self.get_tool_list()
+        tool_list = self.get_tool_list(tool_map)
         skill_list = self.get_skill_list()
         file_list = ", ".join(
             os.path.abspath(os.path.join(self.project_directory, f))
             for f in os.listdir(self.project_directory)
         )
         # 把一段带占位符的模板字符串，填上真实数据
-        return Template(system_prompt_template).substitute(
+        variables = dict(
             operating_system=self.get_operating_system_name(),
             tool_list=tool_list,
             skill_list=skill_list,
             memory_section=getattr(self, "current_memory_section", "- 暂无可用长期记忆"),
             file_list=file_list
         )
+        if extra_vars:
+            variables.update(extra_vars)
+        return Template(system_prompt_template).substitute(variables)
         
     def get_api_key(self) -> str:
         """Load the API key from an environment variable."""
