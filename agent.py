@@ -104,6 +104,7 @@ class ReActAgent:
         self.tools["send_message"] = self.send_message
         self.tools["broadcast_message"] = self.broadcast_message
         self.tools["read_team_inbox"] = self.read_team_inbox
+        self.tools["get_status"] = self.get_status
         self.tools["request_shutdown"] = self.request_shutdown
         self.tools["review_plan"] = self.review_plan
         excluded_subagent_tools = {
@@ -436,6 +437,38 @@ class ReActAgent:
     def read_team_inbox(self, name: str = "lead") -> str:
         return self.team_manager.read_inbox(name)
 
+    def get_status(self) -> str:
+        members = self.team_manager.config.get("members", [])
+        active = [member for member in members if member["status"] == "working"]
+        idle = [member for member in members if member["status"] == "idle"]
+        shutdown = [member for member in members if member["status"] == "shutdown"]
+        pending_shutdown = sum(1 for request in self.team_manager.shutdown_requests.values() if request["status"] == "pending")
+        pending_plan = sum(1 for request in self.team_manager.plan_requests.values() if request["status"] == "pending")
+        backend = "Google Gemini API" if self.model.startswith("gemini") else f"Ollama 本地 ({self.model})"
+        lines = [
+            "# Agent Status",
+            f"- 模型后端：{backend}",
+            "- Multi-agent 支持：已启用",
+            f"- 队友总数：{len(members)}",
+            f"- working：{len(active)}",
+            f"- idle：{len(idle)}",
+            f"- shutdown：{len(shutdown)}",
+            f"- 待处理 shutdown 请求：{pending_shutdown}",
+            f"- 待审批计划：{pending_plan}",
+            "- 可用团队命令：/status, /team, /inbox [name]",
+        ]
+        return "\n".join(lines)
+
+    def get_multi_agent_usage_guide(self) -> str:
+        return (
+            "\n🤝 Multi-agent 使用说明\n"
+            "- 当前版本已支持 multi-agent；只有创建队友后，才会进入实际团队协作。\n"
+            "- 想触发 multi-agent，可直接说：请用多 agent 模式处理这个任务，并创建 researcher/coder/tester 队友。\n"
+            "- 查看当前状态：/status\n"
+            "- 查看团队成员：/team\n"
+            "- 查看收件箱：/inbox 或 /inbox alice\n"
+        )
+
     def request_shutdown(self, teammate: str) -> str:
         return self.team_manager.request_shutdown(teammate)
 
@@ -447,11 +480,14 @@ class ReActAgent:
             return None
         parts = user_input.split(None, 1)
         command = parts[0].lower()
+        if command == "/status":
+            return self.get_status()
         if command == "/team":
             return self.list_teammates()
         if command == "/inbox":
             target = parts[1].strip() if len(parts) > 1 else "lead"
             return self.read_team_inbox(target)
+
         return None
 
     def _make_bound_tool(self, name: str, doc: str, func: Callable) -> Callable:
@@ -715,6 +751,7 @@ def main(project_directory, model):
     print("\n🤖 Agent 已启动，输入 'exit' 或 'quit' 退出对话")
     print(f"🧠 模型：{model}  ({backend})")
     print(f"📁 工作目录：{project_dir}")
+    print(agent.get_multi_agent_usage_guide())
     print("=" * 50)
 
     while True:

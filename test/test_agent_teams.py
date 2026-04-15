@@ -58,15 +58,17 @@ def test_build_teammate_tools_binds_sender_and_protocol_tools():
 
 def test_special_commands_bridge_to_team_methods():
     agent = ReActAgent.__new__(ReActAgent)
+    agent.get_status = lambda: "status summary"
     agent.list_teammates = lambda: "team roster"
     agent.read_team_inbox = lambda name="lead": f"inbox:{name}"
     agent._handle_special_command = ReActAgent._handle_special_command.__get__(agent, ReActAgent)
 
+    assert agent._handle_special_command("/status") == "status summary"
     assert agent._handle_special_command("/team") == "team roster"
     assert agent._handle_special_command("/inbox") == "inbox:lead"
     assert agent._handle_special_command("/inbox alice") == "inbox:alice"
     assert agent._handle_special_command("not a command") is None
-    print("✅ /team 与 /inbox 命令桥接通过")
+    print("✅ /status、/team 与 /inbox 命令桥接通过")
 
 
 if __name__ == "__main__":
