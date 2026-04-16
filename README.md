@@ -290,23 +290,23 @@ Slash 技能：
 
 ```mermaid
 flowchart TD
-    A[用户输入] --> B[加载 memory section]
-    B --> C[运行 SessionStart Hook]
-    C --> D{是否特殊命令?}
-    D -->|是| E[/status /team /inbox]
-    D -->|否| F{是否 slash skill / 关键词命中?}
-    F -->|是| G[生成 skill hint 或 load_skill 提示]
-    F -->|否| H[直接进入任务决策]
+    A["用户输入"] --> B["加载 memory section"]
+    B --> C["运行 SessionStart Hook"]
+    C --> D{"是否特殊命令"}
+    D -->|是| E["/status · /team · /inbox"]
+    D -->|否| F{"是否命中 slash skill 或关键词"}
+    F -->|是| G["生成 skill hint 或 load_skill 提示"]
+    F -->|否| H["直接进入任务决策"]
     G --> H
-    H --> I{是否通用问答?}
-    I -->|是| J[Direct Answer]
-    I -->|否| K[Plan 阶段生成 step 列表]
-    K --> L{规划成功?}
-    L -->|否| M[降级为纯 ReAct Loop]
-    L -->|是| N[用户确认计划]
-    N --> O[逐步执行 execute_step]
-    O --> P[汇总所有 step 结果]
-    P --> Q[输出 final_answer]
+    H --> I{"是否通用问答"}
+    I -->|是| J["Direct Answer"]
+    I -->|否| K["Plan 阶段生成 step 列表"]
+    K --> L{"规划是否成功"}
+    L -->|否| M["降级为纯 ReAct Loop"]
+    L -->|是| N["用户确认计划"]
+    N --> O["逐步执行 execute_step"]
+    O --> P["汇总所有 step 结果"]
+    P --> Q["输出 final_answer"]
     J --> Q
     M --> Q
 ```
@@ -315,16 +315,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[主智能体] --> B[spawn_teammate]
-    B --> C[TeammateManager 创建线程]
-    C --> D[队友独立 ReAct Loop]
-    D --> E[build_teammate_tools]
-    E --> F[读取 inbox / 执行工具 / 发送消息]
-    F --> G{是否完成任务?}
+    A["主智能体"] --> B["spawn_teammate"]
+    B --> C["TeammateManager 创建线程"]
+    C --> D["队友独立 ReAct Loop"]
+    D --> E["build_teammate_tools"]
+    E --> F["读取 inbox / 执行工具 / 发送消息"]
+    F --> G{"是否完成任务"}
     G -->|否| D
-    G -->|是| H[send_message 或 task_result 回传 lead]
-    A --> I[/team / /status / /inbox]
-    A --> J[request_shutdown / review_plan]
+    G -->|是| H["send_message 或 task_result 回传 lead"]
+    A --> I["/team · /status · /inbox"]
+    A --> J["request_shutdown · review_plan"]
     J --> C
 ```
 
@@ -332,67 +332,67 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[rag/docs 下的 md txt docx pdf] --> B[load_documents]
-    B --> C[按格式解析成 document + blocks]
-    C --> D[build_chunks]
-    D --> E[结构化 chunk + overlap + metadata]
-    E --> F[SentenceTransformer 生成 embedding]
-    F --> G[ChromaDB 持久化]
-    H[query_knowledge_base] --> I[问题 embedding]
+    A["rag/docs 中的 md / txt / docx / pdf"] --> B["load_documents"]
+    B --> C["按格式解析成 document 和 blocks"]
+    C --> D["build_chunks"]
+    D --> E["结构化 chunk、overlap 与 metadata"]
+    E --> F["SentenceTransformer 生成 embedding"]
+    F --> G["ChromaDB 持久化"]
+    H["query_knowledge_base"] --> I["问题 embedding"]
     I --> G
-    G --> J[向量召回候选]
-    J --> K[关键词轻量重排]
-    K --> L[返回片段 + 来源 + 标题 + 章节 + 页码]
+    G --> J["向量召回候选"]
+    J --> K["关键词轻量重排"]
+    K --> L["返回片段、来源、标题、章节、页码"]
 ```
 
 ### 4. Skills
 
 ```mermaid
 flowchart TD
-    A[启动 Agent] --> B[扫描 skills/*/SKILL.md]
-    B --> C[解析 frontmatter 和 Description/Keywords]
-    C --> D[仅保存轻量 manifest]
-    E[用户输入] --> F{是否 /skill-name?}
-    F -->|是| G[精确命中技能]
-    F -->|否| H[match_skill 关键词匹配]
-    G --> I[提示先调用 load_skill]
+    A["启动 Agent"] --> B["扫描 skills/*/SKILL.md"]
+    B --> C["解析 frontmatter 和 Description/Keywords"]
+    C --> D["仅保存轻量 manifest"]
+    E["用户输入"] --> F{"是否 /skill-name"}
+    F -->|是| G["精确命中技能"]
+    F -->|否| H["match_skill 关键词匹配"]
+    G --> I["提示先调用 load_skill"]
     H --> I
-    I --> J[按需读取完整技能正文]
-    J --> K[必要时再读取技能附加资源]
-    K --> L[进入计划或执行阶段]
+    I --> J["按需读取完整技能正文"]
+    J --> K["必要时再读取技能附加资源"]
+    K --> L["进入计划或执行阶段"]
 ```
 
 ### 5. MCP
 
 ```mermaid
 flowchart TD
-    A[项目目录 .mcp/config.json] --> B[load_mcp_server_configs]
-    B --> C[MCPClientManager.load_servers]
-    C --> D[连接 stdio server]
-    D --> E[list_tools]
-    E --> F[MCPToolRegistry 生成包装函数]
-    F --> G[注册到 Agent tools]
-    G --> H[模型在执行阶段调用 mcp_xxx 工具]
-    H --> I[client.call_tool]
-    I --> J[返回格式化结果]
+    A["项目目录 .mcp/config.json"] --> B["load_mcp_server_configs"]
+    B --> C["MCPClientManager.load_servers"]
+    C --> D["连接 stdio server"]
+    D --> E["list_tools"]
+    E --> F["MCPToolRegistry 生成包装函数"]
+    F --> G["注册到 Agent tools"]
+    G --> H["模型在执行阶段调用 mcp_xxx 工具"]
+    H --> I["client.call_tool"]
+    I --> J["返回格式化结果"]
 ```
 
 ### 6. Hook
 
 ```mermaid
 flowchart TD
-    A[用户开始会话] --> B[SessionStart Hook]
-    B --> C{exit_code}
-    C -->|BLOCK| D[直接终止]
-    C -->|APPEND| E[附加消息到任务上下文]
-    C -->|CONTINUE| F[继续执行 Agent]
-    F --> G[模型生成 action]
-    G --> H[PreToolUse Hook]
-    H --> I{是否允许执行工具?}
-    I -->|否| J[返回阻止信息]
-    I -->|是| K[执行工具]
-    K --> L[PostToolUse Hook]
-    L --> M[写回 observation]
+    A["用户开始会话"] --> B["SessionStart Hook"]
+    B --> C{"exit_code"}
+    C -->|BLOCK| D["直接终止"]
+    C -->|APPEND| E["附加消息到任务上下文"]
+    C -->|CONTINUE| F["继续执行 Agent"]
+    F --> G["模型生成 action"]
+    G --> H["PreToolUse Hook"]
+    H --> I{"是否允许执行工具"}
+    I -->|否| J["返回阻止信息"]
+    I -->|是| K["执行工具"]
+    K --> L["PostToolUse Hook"]
+    L --> M["写回 observation"]
 ```
 
 ## 各模块说明
