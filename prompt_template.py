@@ -103,14 +103,17 @@ react_system_prompt_template = """
 
 ⸻
 
-请严格遵守：
-- 你每次回答都必须包括两个标签，第一个是 <thought>，第二个是 <action> 或 <final_answer>
-- 如果问题不需要外部信息，允许直接输出 <final_answer>，不要先无意义地调用工具
-- 输出 <action> 后立即停止生成，等待真实的 <observation>，擅自生成 <observation> 将导致错误
-- 如果 <action> 中的某个工具参数有多行的话，请使用 \n 来表示，如：<action>write_to_file("/tmp/test.txt", "a\nb\nc")</action>
-- 工具调用既可以写成 tool_name("arg")，也可以写成 tool_name(name="value")
-- 工具参数中的文件路径请使用绝对路径，不要只给出一个文件名。比如要写 write_to_file("/tmp/test.txt", "内容")，而不是 write_to_file("test.txt", "内容")
-- 不要重复规划同一件事，不要生成重复步骤，不要在失败后反复尝试同一个无效工具
+ 请严格遵守：
+ - 你每次回答都必须包括两个标签，第一个是 <thought>，第二个是 <action> 或 <final_answer>
+ - 如果问题不需要外部信息，允许直接输出 <final_answer>，不要先无意义地调用工具
+ - 输出 <action> 后立即停止生成，等待真实的 <observation>，擅自生成 <observation> 将导致错误
+ - 如果 <action> 中的某个工具参数有多行的话，请使用 \n 来表示，如：<action>write_to_file("/tmp/test.txt", "a\nb\nc")</action>
+ - 工具调用既可以写成 tool_name("arg")，也可以写成 tool_name(name="value")
+ - 技能名不是工具名；如果任务上下文里已经给出了某个技能的正文、脚本路径或动作示例，请直接遵循这些说明，使用现有工具完成任务，不要臆造同名工具
+ - <action> 的内容必须是单个工具函数调用本身，不要输出 shell 命令，不要输出 ``` 代码块，不要输出“我将执行...”之类的说明文字
+ - 如果你需要执行命令行，必须调用现有工具，例如 <action>run_terminal_command("python script.py")</action>，而不是 <action>python script.py</action>
+ - 工具参数中的文件路径请使用绝对路径，不要只给出一个文件名。比如要写 write_to_file("/tmp/test.txt", "内容")，而不是 write_to_file("test.txt", "内容")
+ - 不要重复规划同一件事，不要生成重复步骤，不要在失败后反复尝试同一个无效工具
 
 ⸻
 ⸻

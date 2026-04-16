@@ -166,6 +166,19 @@ class ReActAgent:
             lines.append(f"           结果：{record['answer'][:200]}{'...' if len(record['answer']) > 200 else ''}")
         return "\n".join(lines)
 
+    def _build_selected_skill_context(self, selected_skill: dict | None) -> str:
+        if not selected_skill:
+            return ""
+        skill_name = selected_skill["name"]
+        skill_body = self.skill_registry.load_skill(skill_name)
+        return (
+            f"\n\n已显式选择技能：{skill_name}。"
+            "该技能正文已由系统预加载，请直接遵循其中的步骤、脚本路径和动作示例执行。"
+            "注意：技能名不是工具名，不要直接调用 skill 名称或自行发明同名工具；"
+            "如果需要执行命令，请严格使用技能正文中给出的现有工具调用格式。"
+            f"\n\n{skill_body}"
+        )
+
     def run(self, user_input: str):
         original_task = user_input
         selected_skill = None
@@ -213,11 +226,11 @@ class ReActAgent:
                 print(f"\n\n 匹配到相关技能：{hinted_skill['name']} — {hinted_skill.get('description', '')}")
 
         skill_hint = ""
+        selected_skill_context = self._build_selected_skill_context(selected_skill)
         if selected_skill:
             skill_hint = (
                 f"\n\n已显式选择技能：{selected_skill['name']}。"
-                f"开始执行前请先调用 load_skill(\"{selected_skill['name']}\") 读取技能正文，"
-                f"仅在需要时再用 read_file 读取该技能列出的附加资源。"
+                "技能正文已经提供在当前任务上下文中，请优先严格遵循其中的说明。"
             )
         elif hinted_skill:
             skill_hint = (
@@ -225,15 +238,21 @@ class ReActAgent:
                 f"如果它确实适用于当前任务，请先调用 load_skill(\"{hinted_skill['name']}\") 再继续执行。"
             )
 
-        task_for_execution = f"{user_input}{skill_hint}"
+        task_for_execution = f"{user_input}{skill_hint}{selected_skill_context}"
         if session_hook_message:
             task_for_execution = f"{task_for_execution}\n\n{session_hook_message}"
         prompt_tool_map = self._build_prompt_tool_map(task_for_execution, selected_skill, hinted_skill)
+        if selected_skill:
+            print("\n\n 已显式选择技能，跳过通用任务规划，按技能正文直接执行...")
+            result = self._react_loop(task_for_execution, context=session_ctx, tool_map=prompt_tool_map)
+            self.session_history.append({"task": original_task, "answer": result})
+            return result
         if self._should_skip_planning(task_for_execution):
             print("\n\n 识别为通用问答，跳过任务规划，优先直接回答...")
             result = self._direct_answer(task_for_execution)
             self.session_history.append({"task": original_task, "answer": result})
             return result
+
         steps = self.plan(task_for_execution, tool_map=prompt_tool_map)
         if not steps:
             print("\n\n 规划失败，降级为纯 ReAct 模式执行...")
@@ -254,28 +273,38 @@ class ReActAgent:
 
         # 执行阶段：依次执行每个步骤，传递上下文（携带会话历史）
         context = session_ctx
+        step_results: list[tuple[str, str]] = []
         for i, step in enumerate(steps, 1):
             print(f"\n\n{'='*50}")
             print(f"▶️  执行 Step {i}/{len(steps)}: {step}")
             print(f"{'='*50}")
             result = self.execute_step(step, context, task_for_execution, tool_map=prompt_tool_map)
+            step_results.append((step, result))
             context += f"\n[Step {i} 结果] {result}"
 
-        # 所有步骤完成后，让模型汇总最终答案
+        failed_steps = [(step, result) for step, result in step_results if self._is_step_result_failure(result)]
+        if failed_steps:
+            failure_lines = ["任务未成功完成。以下步骤执行失败："]
+            for step, result in failed_steps:
+                failure_lines.append(f"- 失败步骤：{step}")
+                failure_lines.append(f"  返回结果：{result}")
+            final_answer = "\n".join(failure_lines)
+            self.session_history.append({"task": original_task, "answer": final_answer})
+            return final_answer
+
         print("\n\n 所有步骤执行完成，正在汇总...")
         summary_messages = [
-            {"role": "system", "content": self.render_system_prompt(react_system_prompt_template, tool_map=prompt_tool_map)},
-            {"role": "user", "content": f"<question>{user_input}</question>\n\n以下是各步骤的执行结果摘要，请基于此给出最终答案：\n{context}\n\n请直接输出 <final_answer>...</final_answer>"}
+            {"role": "system", "content": self.render_system_prompt(direct_answer_system_prompt_template)},
+            {"role": "user", "content": f"<question>{user_input}</question>\n\n以下是各步骤的真实执行结果，请仅基于这些结果给出最终结论，不要声称任何未明确出现的成功：\n{context}\n\n请只输出 <thought>...</thought> 和 <final_answer>...</final_answer>"}
         ]
         final_content = self.dispatch_model(summary_messages)
         final_match = re.search(r"<final_answer>(.*?)</final_answer>", final_content, re.DOTALL)
-        final_answer = final_match.group(1) if final_match else context
+        final_answer = final_match.group(1).strip() if final_match else context
         self.session_history.append({"task": original_task, "answer": final_answer})
         return final_answer
 
     def plan(self, user_input: str, tool_map: dict[str, Callable] | None = None) -> list:
-        """调用一次 LLM 生成步骤列表，返回 step 字符串列表"""
-        print("\n\n 正在规划任务步骤...")
+        print("\n\n 正在规划任务...")
         session_ctx = self._build_session_context()
         context_hint = f"\n\n{session_ctx}" if session_ctx else ""
         messages = [
@@ -287,13 +316,12 @@ class ReActAgent:
         return [s.strip() for s in steps if s.strip()]
 
     def execute_step(self, step: str, context: str, original_task: str, tool_map: dict[str, Callable] | None = None) -> str:
-        """用 ReAct 小循环执行单个步骤，最多 10 轮，返回执行结果摘要"""
-        context_hint = f"\n\n前置步骤执行结果（供参考）：{context}" if context else ""
+        context_hint = f"\n\n以下是前面步骤的执行结果，可作为当前步骤的上下文：\n{context}" if context else ""
         available_tools = tool_map or self.tools
         system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template, tool_map=available_tools)}
         messages = [
             system_msg,
-            {"role": "user", "content": f"<question>总体任务：{original_task}\n\n当前步骤：{step}{context_hint}</question>"}
+            {"role": "user", "content": f"<question>原始任务：{original_task}\n\n当前步骤：{step}{context_hint}</question>"}
         ]
         max_rounds = 10
         tool_failures: dict[str, int] = {}
@@ -303,7 +331,7 @@ class ReActAgent:
 
             thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
             if thought_match:
-                print(f"\n\n💭 Thought: {thought_match.group(1).strip()}")
+                print(f"\n\n🧠 Thought: {thought_match.group(1).strip()}")
 
             if "<final_answer>" in content:
                 final_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
@@ -331,7 +359,6 @@ class ReActAgent:
         return "步骤达到最大执行轮数"
 
     def _react_loop(self, user_input: str, context: str, tool_map: dict[str, Callable] | None = None) -> str:
-        """原始 ReAct 单循环，作为降级兜底"""
         context_hint = f"\n\n{context}" if context else ""
         available_tools = tool_map or self.tools
         system_msg = {"role": "system", "content": self.render_system_prompt(react_system_prompt_template, tool_map=available_tools)}
@@ -348,15 +375,15 @@ class ReActAgent:
 
             thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
             if thought_match:
-                print(f"\n\n💭 Thought: {thought_match.group(1).strip()}")
+                print(f"\n\n🧠 Thought: {thought_match.group(1).strip()}")
 
             if "<final_answer>" in content:
                 final_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
-                return final_match.group(1).strip() if final_match else "步骤完成"
+                return final_match.group(1).strip() if final_match else "任务完成"
 
             action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
             if not action_match:
-                print("\n\n⚠️ 模型未输出 <action>，反馈重试...")
+                print("\n\n格式错误：缺少 <action> 标签，要求模型重试...")
                 messages.append({"role": "user", "content": "<observation>格式错误：你必须输出 <action>...</action> 标签，请重新按格式输出。</observation>"})
                 continue
 
@@ -364,7 +391,7 @@ class ReActAgent:
             try:
                 tool_name, args, kwargs = self.parse_action(action)
             except Exception as e:
-                print(f"\n\n⚠️ Action 解析失败：{e}，反馈重试...")
+                print(f"\n\n⚠️ Action 格式解析失败：{e}，反馈重试...")
                 messages.append({"role": "user", "content": f"<observation>Action 格式解析失败：{e}。请确保格式为 tool_name(\"arg1\", \"arg2\") 或 tool_name(name=\"value\")。</observation>"})
                 continue
 
@@ -379,7 +406,6 @@ class ReActAgent:
         return "ReAct 循环达到最大执行轮数"
 
     def _compress_history(self, messages: list):
-        """当非 system 消息超过阈值时，保留 system + 首条用户问题 + 最近 N 条"""
         non_system = [m for m in messages if m["role"] != "system"]
         if len(non_system) <= self.MAX_HISTORY_MESSAGES:
             return
@@ -388,7 +414,7 @@ class ReActAgent:
         recent = non_system[-(self.MAX_HISTORY_MESSAGES // 2):]
         kept = system_msgs + ([first_user] if first_user and first_user not in recent else []) + recent
         messages[:] = kept
-        print(f"\n\n📦 历史已压缩，保留 {len(messages)} 条消息")
+        print(f"\n\n🗜️ 历史已压缩，保留 {len(messages)} 条消息")
 
     def _append_observation(self, messages: list, observation: str):
         messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
@@ -399,7 +425,11 @@ class ReActAgent:
 
         if tool_name not in tool_map:
             available = ', '.join(tool_map.keys())
-            observation = f"工具 '{tool_name}' 不存在，可用工具：{available}"
+            observation = (
+                f"工具 '{tool_name}' 不存在，可用工具：{available}。"
+                "注意：技能名不是工具名；如果当前任务依赖某个技能，请遵循已加载的技能正文，"
+                "或调用 load_skill(\"skill-name\") 读取技能说明后，再使用现有工具完成任务。"
+            )
             self._append_observation(messages, observation)
             return observation, False
 
@@ -452,6 +482,19 @@ class ReActAgent:
             return True
         return "不在项目目录内" in observation or observation.startswith("工具 '")
 
+    def _is_step_result_failure(self, result: str) -> bool:
+        failure_markers = (
+            "步骤达到最大执行轮数",
+            "ReAct 循环达到最大执行轮数",
+            "工具执行错误：",
+            "工具 '",
+            "不在项目目录内",
+            "操作被用户取消",
+            "步骤被用户取消",
+            "子任务被取消",
+        )
+        return any(marker in result for marker in failure_markers)
+
     def _recover_from_tool_failure(self, tool_name: str, observation: str, failure_counts: dict[str, int], messages: list) -> str | None:
         if not self._is_tool_failure(observation):
             return None
@@ -471,7 +514,6 @@ class ReActAgent:
         return recovery_observation
 
     def task(self, prompt: str) -> str:
-        """在独立上下文中执行子任务，返回结果摘要（不污染父上下文）"""
         print(f"\n\n🔹 派生子智能体：{prompt[:80]}{'...' if len(prompt) > 80 else ''}")
         subagent = SubagentContext(prompt=prompt, tools=self.subagent_tools, agent=self)
         result = subagent.run()
@@ -479,7 +521,6 @@ class ReActAgent:
         return result
 
     def load_skill(self, name: str) -> str:
-        """按需加载技能正文，并仅披露附加资源目录"""
         print(f"\n\n📚 加载技能：{name}")
         return self.skill_registry.load_skill(name)
 
