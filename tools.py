@@ -1,14 +1,34 @@
 import os
 import re
 import subprocess
-from ddgs import DDGS
-import chromadb
-from sentence_transformers import SentenceTransformer
 
 
 MAX_READ_SIZE = 100 * 1024  # 100KB，超过此大小的文件只读取前部分
 
 IGNORED_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.idea', '.vscode', 'chroma_db'}
+
+_DDGS = None
+_chromadb = None
+_SentenceTransformer = None
+
+
+def _get_ddgs_class():
+    global _DDGS
+    if _DDGS is None:
+        from ddgs import DDGS as ImportedDDGS
+        _DDGS = ImportedDDGS
+    return _DDGS
+
+
+def _get_rag_dependencies():
+    global _chromadb, _SentenceTransformer
+    if _chromadb is None:
+        import chromadb as imported_chromadb
+        _chromadb = imported_chromadb
+    if _SentenceTransformer is None:
+        from sentence_transformers import SentenceTransformer as ImportedSentenceTransformer
+        _SentenceTransformer = ImportedSentenceTransformer
+    return _chromadb, _SentenceTransformer
 
 def read_file(file_path):
     """用于读取文件内容（超过100KB的文件只读取前部分）"""
@@ -71,6 +91,7 @@ def search_in_files(keyword, directory):
 def web_search(query: str, max_results: int = 3) -> str:
     """联网搜索工具（ddgs），无需API Key，国内可直接使用"""
     try:
+        DDGS = _get_ddgs_class()
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
 
@@ -95,6 +116,7 @@ _rag_collection = None
 def _get_rag_components():
     """懒加载 RAG 模型和 ChromaDB collection，避免每次调用都重新初始化"""
     global _rag_model, _rag_collection
+    chromadb, SentenceTransformer = _get_rag_dependencies()
     if _rag_model is None:
         _rag_model = SentenceTransformer("all-MiniLM-L6-v2")
     if _rag_collection is None:
